@@ -1,0 +1,1707 @@
+// ============================================================
+// 本地数据层：完全替代原 Express + SQLite 后端
+// 所有游戏数值逻辑复用 @shared/gameRules 与 @shared/achievements，
+// 数值公式与旧服务端逐行一致，未做任何调参。
+// ============================================================
+import {
+  insertRewardSchema,
+  insertTaskSchema,
+  loginSchema,
+  registerSchema,
+  resetSchema,
+  type InsertReward,
+  type InsertTask,
+  type Log,
+  type Milestone,
+  type ProficiencyRow,
+  type Redemption,
+  type Reward,
+  type Session,
+  type SkillNodeRow,
+  type Task,
+  type Timer,
+  type UnlockedAchievementRow,
+  type User,
+} from "@shared/schema";
+import {
+  CATEGORY_KEYS,
+  MAKEUP_DAYS,
+  SKILL_NODES,
+  categoryName,
+  computeSettlement,
+  dateKey,
+  effectsFor,
+  FINISH_BONUS_RATE,
+  FINISH_BONUS_RATE_BOOSTED,
+  isConsecutivePeriod,
+  levelFromXp,
+  levelProgress,
+  levelTitle,
+  periodKey,
+  proficiencyTier,
+  ruleSuggest,
+  weekKey,
+} from "@shared/gameRules";
+import { ACHIEVEMENTS, isAchieved, RARITY_META, type AchievementSnapshot } from "@shared/achievements";
+import {
+  decryptSecretValue,
+  encryptSecretValue,
+  hashSecret,
+  maskKey,
+  randomHex,
+  verifySecret,
+} from "./crypto";
+import { initStorage, readDoc, storageAvailable, writeDoc } from "./storage-driver";
+
+// ---------------- 文档结构 ----------------
+type DbDoc = {
+  version: number;
+  seq: Record<string, number>;
+  appSecret: string;
+  users: User[];
+  sessions: Session[];
+  tasks: Task[];
+  logs: Log[];
+  proficiency: ProficiencyRow[];
+  achievements: UnlockedAchievementRow[];
+  skillNodes: SkillNodeRow[];
+  rewards: Reward[];
+  redemptions: Redemption[];
+  timers: Timer[];
+  /** 「记住登录状态」持久化的活动会话 token */
+  rememberedToken: string | null;
+  /** 每个账号最近一次导出备份的时间 */
+  lastBackupAt: Record<string, number>;
+};
+
+function emptyDoc(): DbDoc {
+  return {
+    version: 1,
+    seq: {},
+    appSecret: randomHex(32),
+    users: [],
+    sessions: [],
+    tasks: [],
+    logs: [],
+    proficiency: [],
+    achievements: [],
+    skillNodes: [],
+    rewards: [],
+    redemptions: [],
+    timers: [],
+    rememberedToken: null,
+    lastBackupAt: {},
+  };
+}
+
+let doc: DbDoc = emptyDoc();
+let loaded = false;
+let loading: Promise<void> | null = null;
+let writeChain: Promise<void> = Promise.resolve();
+
+export class LocalError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export async function ensureLoaded(): Promise<void> {
+  if (loaded) return;
+  if (loading) return loading;
+  loading = (async () => {
+    await initStorage();
+    const raw = await readDoc();
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as DbDoc;
+        doc = { ...emptyDoc(), ...parsed };
+        if (!doc.appSecret) doc.appSecret = randomHex(32);
+        if (!doc.lastBackupAt) doc.lastBackupAt = {};
+      } catch {
+        doc = emptyDoc();
+      }
+    } else {
+      doc = emptyDoc();
+      await writeDoc(JSON.stringify(doc));
+    }
+    loaded = true;
+  })();
+  return loading;
+}
+
+/** 串行化写入，避免并发结算互相覆盖 */
+function persist(): Promise<void> {
+  const snapshot = JSON.stringify(doc);
+  writeChain = writeChain.then(() => writeDoc(snapshot)).catch(() => undefined);
+  return writeChain;
+}
+
+function nextId(table: keyof DbDoc): number {
+  const key = String(table);
+  const cur = doc.seq[key] ?? 0;
+  const id = cur + 1;
+  doc.seq[key] = id;
+  return id;
+}
+
+export function isStorageAvailable(): boolean {
+  return storageAvailable();
+}
+
+// ---------------- 会话 ----------------
+let authToken: string | null = null;
+
+export function setToken(token: string | null) {
+  authToken = token;
+}
+
+export function getToken(): string | null {
+  return authToken;
+}
+
+function getSession(token: string | null): Session | undefined {
+  if (!token) return undefined;
+  return doc.sessions.find((s) => s.token === token);
+}
+
+async function createSession(userId: number, remember: boolean, ttlMs = 30 * 24 * 60 * 60 * 1000): Promise<string> {
+  const token = randomHex(32);
+  doc.sessions.push({ token, userId, expiresAt: Date.now() + ttlMs, createdAt: Date.now() });
+  doc.rememberedToken = remember ? token : null;
+  authToken = token;
+  await persist();
+  return token;
+}
+
+function purgeExpiredSessions() {
+  const now = Date.now();
+  doc.sessions = doc.sessions.filter((s) => s.expiresAt >= now);
+}
+
+function requireUserId(): number {
+  const session = getSession(authToken);
+  if (!session) throw new LocalError("未登录，请重新登录", 401);
+  if (session.expiresAt < Date.now()) {
+    doc.sessions = doc.sessions.filter((s) => s.token !== session.token);
+    if (doc.rememberedToken === session.token) doc.rememberedToken = null;
+    void persist();
+    throw new LocalError("会话已过期，请重新登录", 401);
+  }
+  if (!getUser(session.userId)) {
+    doc.sessions = doc.sessions.filter((s) => s.token !== session.token);
+    void persist();
+    throw new LocalError("账号不存在，请重新登录", 401);
+  }
+  return session.userId;
+}
+
+// ---------------- 登录限流（内存，按用户名） ----------------
+const RATE_WINDOW_MS = 15 * 60 * 1000;
+const RATE_MAX = 8;
+const attempts = new Map<string, { count: number; resetAt: number }>();
+
+function rateLimit(key: string) {
+  const k = key.trim().toLowerCase() || "(anonymous)";
+  const now = Date.now();
+  const cur = attempts.get(k);
+  if (!cur || cur.resetAt < now) {
+    attempts.set(k, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    return;
+  }
+  cur.count += 1;
+  if (cur.count > RATE_MAX) throw new LocalError("尝试次数过多，请 15 分钟后再试", 429);
+}
+
+function clearRate(key: string) {
+  attempts.delete(key.trim().toLowerCase());
+}
+
+// ---------------- 基础读取 ----------------
+function getUser(id: number): User | undefined {
+  return doc.users.find((u) => u.id === id);
+}
+
+function getUserByUsername(username: string): User | undefined {
+  return doc.users.find((u) => u.username === username);
+}
+
+function getProficiency(userId: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const c of CATEGORY_KEYS) out[c] = 0;
+  for (const r of doc.proficiency.filter((p) => p.userId === userId)) out[r.category] = r.value;
+  return out;
+}
+
+function addProficiency(userId: number, category: string, delta: number) {
+  const row = doc.proficiency.find((p) => p.userId === userId && p.category === category);
+  if (row) row.value = Math.max(0, row.value + delta);
+  else doc.proficiency.push({ id: nextId("proficiency"), userId, category, value: Math.max(0, delta) });
+}
+
+function listTasks(userId: number): Task[] {
+  return doc.tasks.filter((t) => t.userId === userId).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function getTask(id: number): Task | undefined {
+  return doc.tasks.find((t) => t.id === id);
+}
+
+function allLogs(userId: number): Log[] {
+  return doc.logs.filter((l) => l.userId === userId);
+}
+
+function unlockedNodes(userId: number): string[] {
+  return doc.skillNodes.filter((n) => n.userId === userId).map((n) => n.nodeId);
+}
+
+function unlockedAchievementIds(userId: number): string[] {
+  return doc.achievements.filter((a) => a.userId === userId).map((a) => a.achievementId);
+}
+
+function parseMilestones(t: Task): Milestone[] {
+  try {
+    return JSON.parse(t.milestones) as Milestone[];
+  } catch {
+    return [];
+  }
+}
+
+function effectiveStreak(task: Task): number {
+  if (task.mode !== "habit" || !task.lastPeriodKey) return 0;
+  const period = task.period as "daily" | "weekly";
+  const cur = periodKey(period);
+  if (task.lastPeriodKey === cur) return task.streak;
+  if (isConsecutivePeriod(period, task.lastPeriodKey, cur)) return task.streak;
+  return 0;
+}
+
+function periodCheckins(task: Task): number {
+  const period = task.period as "daily" | "weekly";
+  const cur = periodKey(period);
+  return doc.logs.filter(
+    (l) => l.taskId === task.id && l.kind === "checkin" && periodKey(period, new Date(l.day + "T12:00:00")) === cur,
+  ).length;
+}
+
+// ---------------- 计时器 ----------------
+function getTimer(userId: number, taskId: number): Timer | undefined {
+  return doc.timers.find((t) => t.userId === userId && t.taskId === taskId);
+}
+
+function elapsedMs(t: Timer): number {
+  return t.accumulatedMs + (t.running && t.startedAt ? Date.now() - t.startedAt : 0);
+}
+
+function startTimer(userId: number, taskId: number): Timer {
+  const existing = getTimer(userId, taskId);
+  const now = Date.now();
+  if (existing) {
+    if (!existing.running) {
+      existing.running = 1;
+      existing.startedAt = now;
+      existing.updatedAt = now;
+    }
+    return existing;
+  }
+  const t: Timer = {
+    id: nextId("timers"),
+    userId,
+    taskId,
+    startedAt: now,
+    accumulatedMs: 0,
+    running: 1,
+    updatedAt: now,
+  };
+  doc.timers.push(t);
+  return t;
+}
+
+function pauseTimer(userId: number, taskId: number): Timer | undefined {
+  const t = getTimer(userId, taskId);
+  if (!t || !t.running) return t;
+  const now = Date.now();
+  t.accumulatedMs = t.accumulatedMs + (now - t.startedAt);
+  t.running = 0;
+  t.startedAt = 0;
+  t.updatedAt = now;
+  return t;
+}
+
+function consumeTimer(userId: number, taskId: number, ms: number) {
+  const t = getTimer(userId, taskId);
+  if (!t) return;
+  const now = Date.now();
+  const remaining = Math.max(0, elapsedMs(t) - ms);
+  t.accumulatedMs = remaining;
+  t.startedAt = t.running ? now : 0;
+  t.updatedAt = now;
+}
+
+function deleteTimer(userId: number, taskId: number) {
+  doc.timers = doc.timers.filter((t) => !(t.userId === userId && t.taskId === taskId));
+}
+
+// ---------------- 视图 ----------------
+function taskView(userId: number, t: Task) {
+  const ms = parseMilestones(t);
+  const timer = t.mode === "timer" ? getTimer(userId, t.id) : undefined;
+  const todayLogs = allLogs(userId).filter((l) => l.taskId === t.id && l.day === dateKey());
+  return {
+    ...t,
+    milestones: ms,
+    effectiveStreak: t.mode === "habit" ? effectiveStreak(t) : 0,
+    periodCheckins: t.mode === "habit" ? periodCheckins(t) : 0,
+    todayBlocks:
+      t.mode === "timer"
+        ? todayLogs
+            .filter((l) => l.kind === "block" || l.kind === "manual")
+            .reduce((a, l) => a + Math.max(1, Math.round(l.ratio)), 0)
+        : 0,
+    todayXp: todayLogs.reduce((a, l) => a + l.xp, 0),
+    timer: timer
+      ? { running: !!timer.running, elapsedMs: elapsedMs(timer), startedAt: timer.startedAt, accumulatedMs: timer.accumulatedMs }
+      : null,
+  };
+}
+
+async function publicUser(id: number) {
+  const u = getUser(id)!;
+  const plainKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
+  return {
+    id: u.id,
+    username: u.username,
+    displayName: u.displayName,
+    xp: u.xp,
+    points: u.points,
+    theme: u.theme,
+    aiConfigured: !!u.aiApiKey,
+    hasKey: !!u.aiApiKey,
+    aiBaseUrl: u.aiBaseUrl,
+    aiModel: u.aiModel,
+    aiKeyMasked: maskKey(plainKey),
+    securityQuestion: u.securityQuestion,
+  };
+}
+
+function todayTotals(userId: number) {
+  const day = dateKey();
+  const rows = allLogs(userId).filter((l) => l.day === day);
+  const cats = Array.from(new Set(rows.filter((r) => r.xp > 0).map((r) => r.category)));
+  return {
+    xp: rows.reduce((a, r) => a + r.xp, 0),
+    points: rows.reduce((a, r) => a + r.points, 0),
+    minutes: rows.reduce((a, r) => a + r.minutes, 0),
+    settlements: rows.filter((r) => r.xp > 0).length,
+    categories: cats,
+  };
+}
+
+function buildSnapshot(userId: number): AchievementSnapshot {
+  const user = getUser(userId)!;
+  const logsAll = allLogs(userId);
+  const taskList = listTasks(userId);
+  const byDay = new Map<string, Set<number>>();
+  const byWeek = new Map<string, Set<string>>();
+  let totalMinutes = 0;
+  for (const l of logsAll) {
+    totalMinutes += l.minutes;
+    if (l.xp > 0) {
+      if (!byDay.has(l.day)) byDay.set(l.day, new Set());
+      byDay.get(l.day)!.add(l.taskId);
+      const wk = weekKey(new Date(l.day + "T12:00:00"));
+      if (!byWeek.has(wk)) byWeek.set(wk, new Set());
+      byWeek.get(wk)!.add(l.category);
+    }
+  }
+  let maxTasksInOneDay = 0;
+  byDay.forEach((s) => (maxTasksInOneDay = Math.max(maxTasksInOneDay, s.size)));
+  let balancedWeek = false;
+  byWeek.forEach((s) => {
+    if (CATEGORY_KEYS.every((c) => s.has(c))) balancedWeek = true;
+  });
+  const maxStreak = taskList.reduce((a, t) => Math.max(a, t.bestStreak), 0);
+  return {
+    level: levelFromXp(user.xp),
+    proficiency: getProficiency(userId),
+    totalFocusMinutes: totalMinutes,
+    maxStreak,
+    maxTasksInOneDay,
+    balancedWeek,
+  };
+}
+
+function checkAchievements(userId: number): string[] {
+  const snapshot = buildSnapshot(userId);
+  const already = new Set(unlockedAchievementIds(userId));
+  const newly: string[] = [];
+  let bonus = 0;
+  for (const a of ACHIEVEMENTS) {
+    if (already.has(a.id)) continue;
+    if (isAchieved(a, snapshot)) {
+      doc.achievements.push({ id: nextId("achievements"), userId, achievementId: a.id, unlockedAt: Date.now() });
+      newly.push(a.id);
+      bonus += RARITY_META[a.rarity].reward;
+    }
+  }
+  if (bonus > 0) {
+    const u = getUser(userId)!;
+    u.points += bonus;
+  }
+  return newly;
+}
+
+function inactiveDays(userId: number): number {
+  const all = allLogs(userId).filter((l) => l.xp > 0);
+  if (all.length === 0) return 0;
+  let days = 0;
+  for (let i = 0; i < 60; i++) {
+    const key = dateKey(new Date(Date.now() - i * 86400000));
+    if (all.some((l) => l.day === key)) break;
+    days++;
+  }
+  return days;
+}
+
+// ---------------- 核心结算 ----------------
+function applySettlement(opts: {
+  userId: number;
+  task: Task;
+  kind: string;
+  ratio: number;
+  minutes?: number;
+  day?: string;
+  note?: string;
+  ignoreStreak?: boolean;
+  streakOverride?: number;
+  sign?: 1 | -1;
+}): { xp: number; points: number; prof: number; streakMul: number } {
+  const { userId, task } = opts;
+  const sign = opts.sign ?? 1;
+  const day = opts.day ?? dateKey();
+  const effects = effectsFor(unlockedNodes(userId), task.category);
+  const dayLogs = allLogs(userId).filter((l) => l.day === day);
+  const crossCategoryToday = dayLogs.some((l) => l.category !== task.category && l.xp > 0);
+  const streak = opts.ignoreStreak ? 0 : opts.streakOverride ?? effectiveStreak(task);
+
+  const res = computeSettlement({
+    xpPerUnit: task.xpPerUnit,
+    pointsPerUnit: task.pointsPerUnit,
+    profPerUnit: task.profPerUnit,
+    difficulty: task.difficulty,
+    ratio: opts.ratio,
+    mode: task.mode as any,
+    streak: opts.ignoreStreak ? 0 : streak,
+    effects,
+    crossCategoryToday,
+  });
+
+  const xp = res.xp * sign;
+  const points = res.points * sign;
+  const prof = res.prof * sign;
+  const minutes = (opts.minutes ?? 0) * sign;
+
+  const user = getUser(userId)!;
+  user.xp = Math.max(0, user.xp + xp);
+  user.points = Math.max(0, user.points + points);
+  addProficiency(userId, task.category, prof);
+  doc.logs.push({
+    id: nextId("logs"),
+    userId,
+    taskId: task.id,
+    taskTitle: task.title,
+    category: task.category,
+    mode: task.mode,
+    kind: opts.kind,
+    day,
+    xp,
+    points,
+    prof,
+    minutes,
+    ratio: opts.ratio * sign,
+    note: opts.note ?? "",
+    createdAt: Date.now(),
+  });
+  return { xp, points, prof, streakMul: res.streakMul };
+}
+
+function finishBonus(userId: number, task: Task, sign: 1 | -1 = 1) {
+  const effects = effectsFor(unlockedNodes(userId), task.category);
+  const rate = effects.summit ? FINISH_BONUS_RATE_BOOSTED : FINISH_BONUS_RATE;
+  const r = applySettlement({
+    userId,
+    task,
+    kind: sign === 1 ? "finish" : "finish_undo",
+    ratio: rate,
+    note: sign === 1 ? `收官奖励 ${Math.round(rate * 100)}%` : `回收收官奖励`,
+    ignoreStreak: true,
+    sign,
+  });
+  return { xp: r.xp, points: r.points, prof: r.prof };
+}
+
+// ---------------- 账号 ----------------
+const DEFAULT_REWARDS: InsertReward[] = [
+  { name: "看一部电影", description: "挑一部一直想看的片子，完整看完不刷手机", cost: 200, emoji: "🎬", stock: -1, tag: "休闲" },
+  { name: "一杯手冲咖啡", description: "去喜欢的那家店坐一会儿", cost: 120, emoji: "☕", stock: -1, tag: "小确幸" },
+  { name: "买一本想要的书", description: "书单里排最前面的那本", cost: 500, emoji: "📚", stock: -1, tag: "学习" },
+  { name: "打一晚游戏不设限", description: "彻底放松，不带负罪感", cost: 350, emoji: "🎮", stock: -1, tag: "休闲" },
+  { name: "睡到自然醒", description: "不设闹钟的一个早上", cost: 300, emoji: "😴", stock: -1, tag: "恢复" },
+  { name: "一次好好的下馆子", description: "点想吃的，不看价格", cost: 800, emoji: "🍜", stock: -1, tag: "美食" },
+  { name: "周末一日游", description: "去城市周边走一天", cost: 2000, emoji: "🚞", stock: -1, tag: "旅行" },
+  { name: "换一件想要的装备", description: "犒劳自己一件耐用好物", cost: 5000, emoji: "🎧", stock: 1, tag: "犒赏" },
+];
+
+async function createUserRecord(data: {
+  username: string;
+  password: string;
+  displayName?: string;
+  securityQuestion: string;
+  securityAnswer: string;
+}): Promise<User> {
+  const user: User = {
+    id: nextId("users"),
+    username: data.username,
+    password: await hashSecret(data.password),
+    displayName: data.displayName?.trim() || data.username,
+    securityQuestion: data.securityQuestion,
+    securityAnswer: await hashSecret(data.securityAnswer.trim().toLowerCase()),
+    xp: 0,
+    points: 0,
+    theme: "dark",
+    aiBaseUrl: "https://api.deepseek.com/v1",
+    aiApiKey: "",
+    aiModel: "deepseek-chat",
+    createdAt: Date.now(),
+  };
+  doc.users.push(user);
+  for (const c of CATEGORY_KEYS) {
+    doc.proficiency.push({ id: nextId("proficiency"), userId: user.id, category: c, value: 0 });
+  }
+  for (const r of DEFAULT_REWARDS) {
+    doc.rewards.push({ ...r, id: nextId("rewards"), userId: user.id, createdAt: Date.now() });
+  }
+  return user;
+}
+
+function createTaskRecord(userId: number, data: InsertTask): Task {
+  const ms: Milestone[] = (data.milestones ?? []).map((m, i) => ({
+    id: m.id || `m${i + 1}`,
+    title: m.title,
+    weight: m.weight || 1,
+    done: false,
+  }));
+  const t: Task = {
+    id: nextId("tasks"),
+    userId,
+    title: data.title,
+    category: data.category,
+    mode: data.mode,
+    difficulty: data.difficulty,
+    xpPerUnit: data.xpPerUnit,
+    pointsPerUnit: data.pointsPerUnit,
+    profPerUnit: data.profPerUnit,
+    notes: data.notes ?? "",
+    startDate: data.startDate ?? "",
+    endDate: data.endDate ?? "",
+    archived: 0,
+    blockMinutes: data.blockMinutes,
+    dailyTargetBlocks: data.dailyTargetBlocks,
+    milestones: JSON.stringify(ms),
+    finishBonusGranted: 0,
+    period: data.period,
+    targetPerPeriod: data.targetPerPeriod,
+    streak: 0,
+    bestStreak: 0,
+    lastPeriodKey: "",
+    unitName: data.unitName,
+    targetCount: data.targetCount,
+    currentCount: 0,
+    createdAt: Date.now(),
+  };
+  doc.tasks.push(t);
+  return t;
+}
+
+function clearUserData(userId: number) {
+  doc.tasks = doc.tasks.filter((t) => t.userId !== userId);
+  doc.logs = doc.logs.filter((l) => l.userId !== userId);
+  doc.timers = doc.timers.filter((t) => t.userId !== userId);
+  doc.achievements = doc.achievements.filter((a) => a.userId !== userId);
+  doc.skillNodes = doc.skillNodes.filter((n) => n.userId !== userId);
+  doc.redemptions = doc.redemptions.filter((r) => r.userId !== userId);
+  const u = getUser(userId);
+  if (u) {
+    u.xp = 0;
+    u.points = 0;
+  }
+  for (const p of doc.proficiency.filter((p) => p.userId === userId)) p.value = 0;
+}
+
+// ============================================================
+// 对外操作（原 Express 路由的逻辑等价物）
+// ============================================================
+
+export async function bootstrap() {
+  await ensureLoaded();
+  return { hasUsers: doc.users.length > 0, storageAvailable: storageAvailable() };
+}
+
+export async function register(input: unknown, remember = true) {
+  await ensureLoaded();
+  const parsed = registerSchema.safeParse(input);
+  if (!parsed.success) throw new LocalError(parsed.error.issues[0]?.message ?? "参数有误");
+  if (getUserByUsername(parsed.data.username)) throw new LocalError("该用户名已被使用");
+  const user = await createUserRecord(parsed.data);
+  const token = await createSession(user.id, remember);
+  return { user: await publicUser(user.id), token };
+}
+
+export async function login(input: unknown, remember = true) {
+  await ensureLoaded();
+  const parsed = loginSchema.safeParse(input);
+  if (!parsed.success) throw new LocalError("请输入用户名与密码");
+  rateLimit(`login:${parsed.data.username}`);
+  const user = getUserByUsername(parsed.data.username);
+  // 不区分「用户不存在」与「密码错误」，避免用户名枚举
+  const ok = user ? await verifySecret(parsed.data.password, user.password) : false;
+  if (!user || !ok) throw new LocalError("用户名或密码不正确", 401);
+  clearRate(`login:${parsed.data.username}`);
+  purgeExpiredSessions();
+  const token = await createSession(user.id, remember);
+  return { user: await publicUser(user.id), token };
+}
+
+export async function logout() {
+  await ensureLoaded();
+  if (authToken) {
+    doc.sessions = doc.sessions.filter((s) => s.token !== authToken);
+    if (doc.rememberedToken === authToken) doc.rememberedToken = null;
+  }
+  authToken = null;
+  await persist();
+  return { ok: true };
+}
+
+/** 页面刷新后恢复「记住登录状态」的会话 */
+export async function restoreSession() {
+  await ensureLoaded();
+  const token = doc.rememberedToken;
+  if (!token) return { user: null, token: null };
+  const session = getSession(token);
+  if (!session || session.expiresAt < Date.now() || !getUser(session.userId)) {
+    doc.rememberedToken = null;
+    doc.sessions = doc.sessions.filter((s) => s.token !== token);
+    await persist();
+    return { user: null, token: null };
+  }
+  authToken = token;
+  return { user: await publicUser(session.userId), token };
+}
+
+export async function getSecurityQuestion(username: string) {
+  await ensureLoaded();
+  rateLimit(`reset:${username}`);
+  const user = getUserByUsername(username);
+  if (!user) throw new LocalError("无法获取安全问题，请核对用户名", 404);
+  return { question: user.securityQuestion };
+}
+
+export async function resetPassword(input: unknown) {
+  await ensureLoaded();
+  const parsed = resetSchema.safeParse(input);
+  if (!parsed.success) throw new LocalError(parsed.error.issues[0]?.message ?? "参数有误");
+  rateLimit(`reset:${parsed.data.username}`);
+  const user = getUserByUsername(parsed.data.username);
+  const ok = user ? await verifySecret(parsed.data.answer.trim().toLowerCase(), user.securityAnswer) : false;
+  if (!user || !ok) throw new LocalError("用户名或安全问题答案不正确");
+  user.password = await hashSecret(parsed.data.newPassword);
+  // 密码重置后失效所有旧会话
+  doc.sessions = doc.sessions.filter((s) => s.userId !== user.id);
+  doc.rememberedToken = null;
+  clearRate(`reset:${parsed.data.username}`);
+  await persist();
+  return { ok: true };
+}
+
+export async function changePassword(oldPassword: string, newPassword: string) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const user = getUser(userId)!;
+  if (!(await verifySecret(String(oldPassword ?? ""), user.password))) throw new LocalError("原密码不正确");
+  if (String(newPassword ?? "").length < 6) throw new LocalError("新密码至少 6 位");
+  user.password = await hashSecret(newPassword);
+  await persist();
+  return { ok: true };
+}
+
+export async function getProfile() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const lp = levelProgress(u.xp);
+  const prof = getProficiency(userId);
+  const topProfCategory = CATEGORY_KEYS.slice().sort((a, b) => (prof[b] ?? 0) - (prof[a] ?? 0))[0] ?? "academic";
+  return {
+    user: await publicUser(userId),
+    ...lp,
+    proficiency: prof,
+    proficiencyTiers: Object.fromEntries(CATEGORY_KEYS.map((c) => [c, proficiencyTier(prof[c] ?? 0)])),
+    unlockedNodes: unlockedNodes(userId),
+    unlockedAchievements: unlockedAchievementIds(userId),
+    today: todayTotals(userId),
+    snapshot: buildSnapshot(userId),
+    inactiveDays: inactiveDays(userId),
+    topProfCategory,
+    topProfCategoryName: categoryName(topProfCategory),
+    backup: backupStatus(userId),
+  };
+}
+
+// ---------------- 任务 ----------------
+export async function getTasks() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return listTasks(userId).map((t) => taskView(userId, t));
+}
+
+export async function createTask(input: unknown) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const parsed = insertTaskSchema.safeParse(input);
+  if (!parsed.success) throw new LocalError(parsed.error.issues[0]?.message ?? "任务参数有误");
+  const task = createTaskRecord(userId, parsed.data);
+  await persist();
+  return taskView(userId, task);
+}
+
+export async function updateTask(id: number, body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const existing = getTask(id);
+  if (!existing || existing.userId !== userId) throw new LocalError("任务不存在", 404);
+  const partial = insertTaskSchema.partial().safeParse(body?.task ?? {});
+  if (!partial.success) throw new LocalError(partial.error.issues[0]?.message ?? "参数有误");
+  const patch: any = { ...partial.data };
+  if (typeof body?.archived === "number") patch.archived = body.archived;
+  if (partial.data.milestones) {
+    const old = parseMilestones(existing);
+    patch.milestones = JSON.stringify(
+      partial.data.milestones.map((m, i) => ({
+        id: m.id || `m${i + 1}`,
+        title: m.title,
+        weight: m.weight || 1,
+        done: old.find((o) => o.id === m.id)?.done ?? false,
+      })),
+    );
+  }
+  Object.assign(existing, patch);
+  await persist();
+  return taskView(userId, existing);
+}
+
+export async function deleteTask(id: number) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const t = getTask(id);
+  if (!t || t.userId !== userId) throw new LocalError("任务不存在", 404);
+  doc.tasks = doc.tasks.filter((x) => x.id !== id);
+  doc.logs = doc.logs.filter((l) => l.taskId !== id);
+  doc.timers = doc.timers.filter((x) => x.taskId !== id);
+  await persist();
+  return { ok: true };
+}
+
+// ---------------- 计时器 ----------------
+export async function timerAction(taskId: number, action: string) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const task = getTask(taskId);
+  if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+
+  if (action === "start") {
+    startTimer(userId, taskId);
+    await persist();
+    return { ok: true, timer: taskView(userId, task).timer };
+  }
+  if (action === "pause") {
+    pauseTimer(userId, taskId);
+    await persist();
+    return { ok: true, timer: taskView(userId, task).timer };
+  }
+  if (action === "abandon") {
+    deleteTimer(userId, taskId);
+    await persist();
+    return { ok: true, timer: null, message: "已放弃本次计时，没有任何扣减。" };
+  }
+  if (action === "claim" || action === "complete") {
+    const timer = getTimer(userId, taskId);
+    if (!timer) throw new LocalError("计时器未启动");
+    const elapsed = elapsedMs(timer);
+    const blockMs = task.blockMinutes * 60 * 1000;
+    const blocks = Math.floor(elapsed / blockMs);
+    if (blocks < 1) {
+      if (action === "complete") {
+        deleteTimer(userId, taskId);
+        await persist();
+        return {
+          ok: true,
+          gained: { xp: 0, points: 0, prof: 0, minutes: 0 },
+          newAchievements: [],
+          message: `不足一个专注块（${task.blockMinutes} 分钟），本次未结算，但时间没有白费。`,
+        };
+      }
+      throw new LocalError("尚未满一个专注块");
+    }
+    const before = levelFromXp(getUser(userId)!.xp);
+    const r = applySettlement({
+      userId,
+      task,
+      kind: "block",
+      ratio: blocks,
+      minutes: blocks * task.blockMinutes,
+      note: `完成 ${blocks} 个专注块`,
+    });
+    if (action === "complete") deleteTimer(userId, taskId);
+    else consumeTimer(userId, taskId, blocks * blockMs);
+    const after = levelFromXp(getUser(userId)!.xp);
+    const newAchievements = checkAchievements(userId);
+    await persist();
+    return {
+      ok: true,
+      gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: blocks * task.blockMinutes },
+      blocks,
+      levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+      newAchievements,
+      message: `完成 ${blocks} 个专注块`,
+    };
+  }
+  throw new LocalError("未知操作");
+}
+
+export async function manualTime(taskId: number, body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const task = getTask(taskId);
+  if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+  const minutes = Math.max(0, Math.floor(Number(body?.minutes) || 0));
+  const day = String(body?.day || dateKey());
+  const blocks = Math.floor(minutes / task.blockMinutes);
+  if (blocks < 1) throw new LocalError(`不足一个专注块（${task.blockMinutes} 分钟），无法结算`);
+  const before = levelFromXp(getUser(userId)!.xp);
+  const r = applySettlement({
+    userId,
+    task,
+    kind: "manual",
+    ratio: blocks,
+    minutes: blocks * task.blockMinutes,
+    day,
+    note: `补记 ${minutes} 分钟`,
+  });
+  const after = levelFromXp(getUser(userId)!.xp);
+  const newAchievements = checkAchievements(userId);
+  await persist();
+  return {
+    ok: true,
+    gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: blocks * task.blockMinutes },
+    blocks,
+    levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+    newAchievements,
+    message: `补记 ${blocks} 个专注块`,
+  };
+}
+
+// ---------------- 里程碑 ----------------
+export async function toggleMilestone(taskId: number, body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const task = getTask(taskId);
+  if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+  const milestoneId = String(body?.milestoneId ?? "");
+  const done = !!body?.done;
+  const ms = parseMilestones(task);
+  const target = ms.find((m) => m.id === milestoneId);
+  if (!target) throw new LocalError("里程碑节点不存在", 404);
+  if (target.done === done) return { ok: true, gained: { xp: 0, points: 0, prof: 0, minutes: 0 }, newAchievements: [] };
+  const totalWeight = ms.reduce((a, m) => a + (m.weight || 1), 0) || 1;
+  const ratio = (target.weight || 1) / totalWeight;
+  const before = levelFromXp(getUser(userId)!.xp);
+
+  const r = applySettlement({
+    userId,
+    task,
+    kind: done ? "milestone" : "milestone_undo",
+    ratio,
+    note: `${done ? "完成" : "撤销"}节点「${target.title}」`,
+    sign: done ? 1 : -1,
+    ignoreStreak: true,
+  });
+
+  target.done = done;
+  const allDone = ms.every((m) => m.done);
+  const hadBonus = task.finishBonusGranted;
+  task.milestones = JSON.stringify(ms);
+  let bonus: { xp: number; points: number; prof: number } | null = null;
+  if (allDone && !hadBonus) {
+    bonus = finishBonus(userId, task);
+    task.finishBonusGranted = 1;
+  } else if (!allDone && hadBonus) {
+    finishBonus(userId, task, -1);
+    task.finishBonusGranted = 0;
+  }
+  const after = levelFromXp(getUser(userId)!.xp);
+  const newAchievements = checkAchievements(userId);
+  await persist();
+  return {
+    ok: true,
+    gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: 0 },
+    finishBonus: bonus,
+    levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+    newAchievements,
+    message: done ? `节点「${target.title}」已完成` : `已撤销「${target.title}」，奖励同步回收`,
+  };
+}
+
+// ---------------- 打卡 ----------------
+export async function checkin(taskId: number, body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const task = getTask(taskId);
+  if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+  const percent = Math.max(1, Math.min(100, Math.round(Number(body?.percent ?? 100))));
+  const ratio = percent / 100;
+  const day = String(body?.day || dateKey());
+  const isMakeup = day !== dateKey();
+  if (isMakeup) {
+    const diff = Math.round(
+      (new Date(dateKey() + "T00:00:00").getTime() - new Date(day + "T00:00:00").getTime()) / 86400000,
+    );
+    if (diff < 0 || diff > MAKEUP_DAYS) throw new LocalError(`只能为过去 ${MAKEUP_DAYS} 天内的漏签补卡`);
+  }
+
+  const period = task.period as "daily" | "weekly";
+  let streak = effectiveStreak(task);
+  let streakChanged = false;
+  let message = "";
+
+  if (!isMakeup) {
+    const doneThisPeriod = periodCheckins(task);
+    const curKey = periodKey(period);
+    if (doneThisPeriod + 1 >= task.targetPerPeriod && task.lastPeriodKey !== curKey) {
+      if (task.lastPeriodKey && isConsecutivePeriod(period, task.lastPeriodKey, curKey)) {
+        streak = task.streak + 1;
+      } else {
+        streak = 1;
+        if (task.streak >= 3) message = "从今天重新开始，前面积累的熟练度一分没少。";
+      }
+      streakChanged = true;
+    }
+  }
+
+  const before = levelFromXp(getUser(userId)!.xp);
+  const r = applySettlement({
+    userId,
+    task,
+    kind: isMakeup ? "makeup" : "checkin",
+    ratio,
+    day,
+    note: isMakeup ? `补签 ${percent}%` : `打卡 ${percent}%`,
+    ignoreStreak: isMakeup,
+    streakOverride: isMakeup ? 0 : streak,
+  });
+
+  if (streakChanged) {
+    task.streak = streak;
+    task.bestStreak = Math.max(task.bestStreak, streak);
+    task.lastPeriodKey = periodKey(period);
+  }
+  const after = levelFromXp(getUser(userId)!.xp);
+  const newAchievements = checkAchievements(userId);
+  await persist();
+  return {
+    ok: true,
+    gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: 0 },
+    streak: streakChanged ? streak : effectiveStreak(task),
+    streakMul: r.streakMul,
+    levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+    newAchievements,
+    message: message || (isMakeup ? `补签成功（补签不计入连续加成）` : `打卡成功 ${percent}%`),
+  };
+}
+
+// ---------------- 计件 ----------------
+export async function countUp(taskId: number, body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const task = getTask(taskId);
+  if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+  const delta = Math.max(1, Math.min(100000, Math.floor(Number(body?.delta ?? 1))));
+  const before = levelFromXp(getUser(userId)!.xp);
+  const r = applySettlement({
+    userId,
+    task,
+    kind: "count",
+    ratio: delta,
+    note: `+${delta} ${task.unitName}`,
+    ignoreStreak: true,
+  });
+  const newCount = task.currentCount + delta;
+  const hadBonus = task.finishBonusGranted;
+  task.currentCount = newCount;
+  let bonus: { xp: number; points: number; prof: number } | null = null;
+  if (newCount >= task.targetCount && !hadBonus) {
+    bonus = finishBonus(userId, task);
+    task.finishBonusGranted = 1;
+  }
+  const after = levelFromXp(getUser(userId)!.xp);
+  const newAchievements = checkAchievements(userId);
+  await persist();
+  return {
+    ok: true,
+    gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: 0 },
+    finishBonus: bonus,
+    levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+    newAchievements,
+    message: `+${delta} ${task.unitName}`,
+  };
+}
+
+// ---------------- 流水 / 统计 ----------------
+export async function getLogs(limit = 200) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return allLogs(userId)
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, limit);
+}
+
+export async function getStats() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const all = allLogs(userId);
+  const today = new Date();
+  const daily: { day: string; label: string; xp: number; points: number; minutes: number }[] = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    const key = dateKey(d);
+    const rows = all.filter((l) => l.day === key);
+    daily.push({
+      day: key,
+      label: `${d.getMonth() + 1}/${d.getDate()}`,
+      xp: rows.reduce((a, r) => a + r.xp, 0),
+      points: rows.reduce((a, r) => a + r.points, 0),
+      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+    });
+  }
+  const weekly: { week: string; label: string; minutes: number; xp: number }[] = [];
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 7 * 86400000);
+    const wk = weekKey(d);
+    const rows = all.filter((l) => weekKey(new Date(l.day + "T12:00:00")) === wk);
+    weekly.push({
+      week: wk,
+      label: wk.split("-W")[1] + "周",
+      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+      xp: rows.reduce((a, r) => a + r.xp, 0),
+    });
+  }
+  const prof = getProficiency(userId);
+  const byCategory = CATEGORY_KEYS.map((c) => {
+    const rows = all.filter((l) => l.category === c);
+    return {
+      category: c,
+      xp: rows.reduce((a, r) => a + r.xp, 0),
+      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+      prof: prof[c] ?? 0,
+      tier: proficiencyTier(prof[c] ?? 0).name,
+    };
+  });
+  const heatmap: { day: string; xp: number; count: number }[] = [];
+  for (let i = 89; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    const key = dateKey(d);
+    const rows = all.filter((l) => l.day === key);
+    heatmap.push({ day: key, xp: rows.reduce((a, r) => a + r.xp, 0), count: rows.filter((r) => r.xp > 0).length });
+  }
+  return {
+    daily,
+    weekly,
+    byCategory,
+    heatmap,
+    totals: {
+      xp: all.reduce((a, r) => a + r.xp, 0),
+      points: all.reduce((a, r) => a + r.points, 0),
+      minutes: all.reduce((a, r) => a + r.minutes, 0),
+      settlements: all.filter((r) => r.xp > 0).length,
+      activeDays: new Set(all.filter((r) => r.xp > 0).map((r) => r.day)).size,
+    },
+  };
+}
+
+// ---------------- 成长树 ----------------
+export async function unlockSkillNode(nodeId: string) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const node = SKILL_NODES.find((n) => n.id === nodeId);
+  if (!node) throw new LocalError("节点不存在");
+  const already = unlockedNodes(userId);
+  if (already.includes(nodeId)) throw new LocalError("该节点已解锁");
+  const prev = SKILL_NODES.find((n) => n.category === node.category && n.slot === node.slot - 1);
+  if (prev && !already.includes(prev.id)) throw new LocalError(`需要先解锁「${prev.name}」`);
+  const prof = getProficiency(userId)[node.category] ?? 0;
+  if (prof < node.profRequired) throw new LocalError(`熟练度不足（${prof}/${node.profRequired}）`);
+  const user = getUser(userId)!;
+  if (user.points < node.cost) throw new LocalError(`积分不足（${user.points}/${node.cost}）`);
+  user.points -= node.cost;
+  doc.skillNodes.push({ id: nextId("skillNodes"), userId, nodeId, unlockedAt: Date.now() });
+  await persist();
+  return { ok: true, unlockedNodes: unlockedNodes(userId) };
+}
+
+// ---------------- 积分商城 ----------------
+export async function getRewards() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return doc.rewards.filter((r) => r.userId === userId).sort((a, b) => a.cost - b.cost);
+}
+
+export async function createReward(input: unknown) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const parsed = insertRewardSchema.safeParse(input);
+  if (!parsed.success) throw new LocalError(parsed.error.issues[0]?.message ?? "参数有误");
+  const reward: Reward = { ...parsed.data, id: nextId("rewards"), userId, createdAt: Date.now() };
+  doc.rewards.push(reward);
+  await persist();
+  return reward;
+}
+
+export async function updateReward(id: number, input: unknown) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const parsed = insertRewardSchema.partial().safeParse(input ?? {});
+  if (!parsed.success) throw new LocalError("参数有误");
+  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  if (!reward) throw new LocalError("奖励不存在", 404);
+  Object.assign(reward, parsed.data);
+  await persist();
+  return reward;
+}
+
+export async function deleteReward(id: number) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  if (!reward) throw new LocalError("奖励不存在", 404);
+  doc.rewards = doc.rewards.filter((r) => r.id !== id);
+  await persist();
+  return { ok: true };
+}
+
+export async function redeemReward(id: number) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  if (!reward) throw new LocalError("奖励不存在", 404);
+  if (reward.stock === 0) throw new LocalError("库存已用完");
+  const user = getUser(userId)!;
+  if (user.points < reward.cost) throw new LocalError(`积分不足，还差 ${reward.cost - user.points} 分`);
+  user.points -= reward.cost;
+  if (reward.stock > 0) reward.stock -= 1;
+  doc.redemptions.push({
+    id: nextId("redemptions"),
+    userId,
+    rewardId: reward.id,
+    name: reward.name,
+    emoji: reward.emoji,
+    cost: reward.cost,
+    createdAt: Date.now(),
+  });
+  await persist();
+  return { ok: true };
+}
+
+export async function getRedemptions(): Promise<Redemption[]> {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return doc.redemptions.filter((r) => r.userId === userId).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// ---------------- 设置 ----------------
+export async function updateSettings(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const user = getUser(userId)!;
+  const b = body ?? {};
+  if (typeof b.aiBaseUrl === "string") user.aiBaseUrl = b.aiBaseUrl.trim();
+  if (typeof b.aiModel === "string") user.aiModel = b.aiModel.trim();
+  if (typeof b.aiApiKey === "string" && b.aiApiKey.trim() !== "") {
+    user.aiApiKey = await encryptSecretValue(b.aiApiKey.trim(), doc.appSecret);
+  }
+  if (b.clearApiKey === true) user.aiApiKey = "";
+  if (typeof b.theme === "string") user.theme = b.theme;
+  if (typeof b.displayName === "string" && b.displayName.trim()) user.displayName = b.displayName.trim();
+  await persist();
+  return { user: await publicUser(userId) };
+}
+
+// ---------------- 备份 ----------------
+function backupStatus(userId: number) {
+  const last = doc.lastBackupAt[String(userId)] ?? 0;
+  const settlements = allLogs(userId).filter((l) => l.xp > 0).length;
+  const daysSince = last ? Math.floor((Date.now() - last) / 86400000) : null;
+  const due = settlements >= 20 && (last === 0 || (daysSince ?? 0) > 14);
+  return { lastBackupAt: last || null, daysSince, settlements, due };
+}
+
+export async function exportData() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const user = getUser(userId)!;
+  const payload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    user: { username: user.username, displayName: user.displayName, xp: user.xp, points: user.points },
+    proficiency: getProficiency(userId),
+    tasks: listTasks(userId),
+    logs: allLogs(userId),
+    achievements: unlockedAchievementIds(userId),
+    skillNodes: unlockedNodes(userId),
+    rewards: doc.rewards.filter((r) => r.userId === userId),
+    redemptions: doc.redemptions.filter((r) => r.userId === userId),
+  };
+  doc.lastBackupAt[String(userId)] = Date.now();
+  await persist();
+  return payload;
+}
+
+export async function importData(payload: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.tasks)) {
+    throw new LocalError("文件格式不正确");
+  }
+  clearUserData(userId);
+  const idMap = new Map<number, number>();
+  for (const t of payload.tasks) {
+    const id = nextId("tasks");
+    const task: Task = {
+      ...(t as Task),
+      id,
+      userId,
+      milestones: typeof t.milestones === "string" ? t.milestones : JSON.stringify(t.milestones ?? []),
+      createdAt: t.createdAt ?? Date.now(),
+    };
+    doc.tasks.push(task);
+    idMap.set(t.id, id);
+  }
+  for (const l of payload.logs ?? []) {
+    doc.logs.push({
+      ...(l as Log),
+      id: nextId("logs"),
+      userId,
+      taskId: idMap.get(l.taskId) ?? 0,
+      createdAt: l.createdAt ?? Date.now(),
+    });
+  }
+  for (const [cat, v] of Object.entries(payload.proficiency ?? {})) {
+    addProficiency(userId, cat, Number(v) || 0);
+  }
+  for (const a of payload.achievements ?? []) {
+    doc.achievements.push({ id: nextId("achievements"), userId, achievementId: String(a), unlockedAt: Date.now() });
+  }
+  for (const n of payload.skillNodes ?? []) {
+    doc.skillNodes.push({ id: nextId("skillNodes"), userId, nodeId: String(n), unlockedAt: Date.now() });
+  }
+  if (Array.isArray(payload.rewards) && payload.rewards.length) {
+    doc.rewards = doc.rewards.filter((r) => r.userId !== userId);
+    for (const r of payload.rewards) {
+      doc.rewards.push({ ...(r as Reward), id: nextId("rewards"), userId, createdAt: r.createdAt ?? Date.now() });
+    }
+  }
+  for (const r of payload.redemptions ?? []) {
+    doc.redemptions.push({
+      ...(r as Redemption),
+      id: nextId("redemptions"),
+      userId,
+      createdAt: r.createdAt ?? Date.now(),
+    });
+  }
+  const user = getUser(userId)!;
+  user.xp = Number(payload.user?.xp) || 0;
+  user.points = Number(payload.user?.points) || 0;
+  await persist();
+  return { ok: true };
+}
+
+export async function clearData() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  clearUserData(userId);
+  await persist();
+  return { ok: true };
+}
+
+// ---------------- AI（浏览器直连） ----------------
+const MAX_AI_BODY_BYTES = 256 * 1024;
+
+function isPrivateIPv4(ip: string): boolean {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
+  if (p[0] === 10 || p[0] === 127 || p[0] === 0) return true;
+  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+  if (p[0] === 192 && p[1] === 168) return true;
+  if (p[0] === 169 && p[1] === 254) return true; // 含 169.254.169.254 元数据地址
+  if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true;
+  if (p[0] >= 224) return true;
+  return false;
+}
+
+function isIPv4(s: string) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+}
+
+function isPrivateAddress(addr: string): boolean {
+  const ip = addr.replace(/^\[|\]$/g, "");
+  if (isIPv4(ip)) return isPrivateIPv4(ip);
+  if (ip.includes(":")) {
+    const low = ip.toLowerCase();
+    if (low === "::1" || low === "::") return true;
+    if (low.startsWith("fe80")) return true;
+    const first = parseInt(low.split(":")[0] || "0", 16);
+    if ((first & 0xfe00) === 0xfc00) return true;
+    const v4 = low.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4) return isPrivateIPv4(v4[1]);
+  }
+  return false;
+}
+
+/** 校验用户提供的 AI 接口地址：必须 https，且不得指向内网/本地/元数据地址 */
+export function assertSafeBaseUrl(raw: string): string {
+  const value = String(raw ?? "").trim();
+  if (!value) throw new LocalError("请先填写 AI 接口地址");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new LocalError("AI 接口地址格式不正确");
+  }
+  if (url.protocol !== "https:") throw new LocalError("AI 接口地址必须使用 https");
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host === "metadata.google.internal"
+  ) {
+    throw new LocalError("不允许访问内网或本地地址");
+  }
+  if (isPrivateAddress(host)) throw new LocalError("不允许访问内网或本地地址");
+  return value;
+}
+
+export const CORS_HINT =
+  "浏览器直连该接口被拒绝（网络或 CORS 限制）。部分供应商不允许网页端直接调用，请改用允许跨域的接口或代理；内置规则引擎依然可以正常给出参数建议。";
+
+class NetworkError extends Error {}
+
+async function callProvider(baseUrl: string, apiKey: string, model: string, messages: any[], jsonMode = true) {
+  const safeBase = assertSafeBaseUrl(baseUrl);
+  const url = `${safeBase.replace(/\/$/, "")}/chat/completions`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  try {
+    let r: Response;
+    try {
+      r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.5,
+          ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+        }),
+        signal: controller.signal,
+        redirect: "error",
+      });
+    } catch (e: any) {
+      if (e?.name === "AbortError") throw new Error("请求超时（20 秒）");
+      throw new NetworkError(CORS_HINT);
+    }
+    const raw = (await r.text()).slice(0, MAX_AI_BODY_BYTES);
+    if (!r.ok) throw new Error(`供应商返回 ${r.status}：${raw.slice(0, 200)}`);
+    return JSON.parse(raw);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function aiTest(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const baseUrl = String(body?.aiBaseUrl || u.aiBaseUrl || "").trim();
+  const model = String(body?.aiModel || u.aiModel || "").trim();
+  const apiKey = String(body?.aiApiKey || (await decryptSecretValue(u.aiApiKey, doc.appSecret)) || "").trim();
+  assertSafeBaseUrl(baseUrl);
+  if (!apiKey) throw new LocalError("尚未配置 API Key");
+  try {
+    const data = await callProvider(baseUrl, apiKey, model, [{ role: "user", content: '回复 JSON {"ok":true}' }]);
+    const content = data?.choices?.[0]?.message?.content ?? "";
+    return { ok: true, message: `连通成功，模型 ${model} 已响应`, raw: String(content).slice(0, 120) };
+  } catch (e: any) {
+    if (e instanceof NetworkError) throw new LocalError(CORS_HINT);
+    throw new LocalError(`连接失败：${e?.message ?? e}`);
+  }
+}
+
+export async function aiSuggest(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const { title = "", category = "academic", mode = "timer", goal = "" } = body ?? {};
+  const fallback = ruleSuggest(String(category), String(mode));
+  const u = getUser(userId)!;
+  if (!u.aiApiKey) {
+    return { ...fallback, source: "rule", notice: "当前使用内置规则，配置 API Key 可获得个性化深度规划。" };
+  }
+  const sys =
+    "你是一个自律管理系统的规划助手。根据用户任务信息，输出严格的 JSON，字段：blockMinutes(整数分钟), dailyTargetBlocks(整数), period('daily'|'weekly'), targetPerPeriod(整数), difficulty(1-4整数), xpPerUnit(整数), pointsPerUnit(整数), profPerUnit(整数), milestones(中文字符串数组，3-6项), reason(一句中文理由)。数值需符合：计时模式单块经验 15-60；计件模式按单个单位给较小值；里程碑模式为整个任务总量给较大值(100-400)。只输出 JSON。";
+  const userMsg = `任务标题：${title}\n类别：${categoryName(String(category))}\n结算模式：${mode}\n用户目标描述：${goal || "（未填写）"}`;
+  try {
+    const apiKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
+    const data = await callProvider(u.aiBaseUrl, apiKey, u.aiModel, [
+      { role: "system", content: sys },
+      { role: "user", content: userMsg },
+    ]);
+    const content = data?.choices?.[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(content);
+    return {
+      blockMinutes: Number(parsed.blockMinutes) || fallback.blockMinutes,
+      dailyTargetBlocks: Number(parsed.dailyTargetBlocks) || fallback.dailyTargetBlocks,
+      period: parsed.period === "weekly" ? "weekly" : fallback.period ?? "daily",
+      targetPerPeriod: Number(parsed.targetPerPeriod) || fallback.targetPerPeriod,
+      targetCount: Number(parsed.targetCount) || fallback.targetCount,
+      unitName: parsed.unitName || fallback.unitName,
+      difficulty: Number(parsed.difficulty) || 2,
+      xpPerUnit: Number(parsed.xpPerUnit) || fallback.xpPerUnit,
+      pointsPerUnit: Number(parsed.pointsPerUnit) || fallback.pointsPerUnit,
+      profPerUnit: Number(parsed.profPerUnit) || fallback.profPerUnit,
+      milestones: Array.isArray(parsed.milestones) ? parsed.milestones.map(String).slice(0, 8) : fallback.milestones,
+      reason: String(parsed.reason ?? fallback.reason),
+      source: "ai",
+    };
+  } catch (e: any) {
+    const reason = e instanceof NetworkError ? CORS_HINT : String(e?.message ?? e).slice(0, 80);
+    return { ...fallback, source: "rule", notice: `AI 调用失败（${reason}），已回退内置规则。` };
+  }
+}
+
+// ============================================================
+// 演示数据
+// ============================================================
+type DemoSpec = {
+  title: string;
+  category: string;
+  mode: string;
+  blockMinutes?: number;
+  chance: number;
+  milestones?: string[];
+};
+
+const DEMO_SPECS: DemoSpec[] = [
+  { title: "博士论文写作", category: "academic", mode: "timer", blockMinutes: 50, chance: 0.8 },
+  { title: "论文章节推进", category: "academic", mode: "milestone", chance: 0.06, milestones: ["确定选题与研究问题", "完成文献综述初稿", "整理数据与方法设计", "完成结果分析", "完成全文初稿"] },
+  { title: "英语精读打卡", category: "language", mode: "habit", chance: 0.72 },
+  { title: "学术英语听力", category: "language", mode: "timer", blockMinutes: 25, chance: 0.45 },
+  { title: "每日快走 30 分钟", category: "life", mode: "habit", chance: 0.62 },
+  { title: "早睡记录", category: "life", mode: "count", chance: 0.5 },
+  { title: "主动联络同行", category: "social", mode: "count", chance: 0.3 },
+  { title: "每周一次深度交流", category: "social", mode: "habit", chance: 0.22 },
+  { title: "记账与预算复盘", category: "finance", mode: "habit", chance: 0.35 },
+];
+
+/** 简单可复现的伪随机数（演示数据用） */
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 在当前账号内生成 60 天演示数据（等价于旧版 yunlong 账号） */
+export async function seedDemoData() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const rand = mulberry32(20260818);
+  const days = 60;
+  const existing = listTasks(userId);
+  const created: Task[] = [];
+  for (const s of DEMO_SPECS) {
+    let t = existing.find((x) => x.title === s.title);
+    if (!t) {
+      const rule = ruleSuggest(s.category, s.mode);
+      t = createTaskRecord(userId, {
+        title: s.title,
+        category: s.category as any,
+        mode: s.mode as any,
+        difficulty: 2,
+        xpPerUnit: rule.xpPerUnit,
+        pointsPerUnit: rule.pointsPerUnit,
+        profPerUnit: rule.profPerUnit,
+        notes: "演示数据",
+        startDate: "",
+        endDate: "",
+        blockMinutes: s.blockMinutes ?? rule.blockMinutes ?? 25,
+        dailyTargetBlocks: rule.dailyTargetBlocks ?? 2,
+        milestones: (s.milestones ?? []).map((title, i) => ({ id: `m${i + 1}`, title, weight: 1, done: false })),
+        period: (rule.period as any) ?? "daily",
+        targetPerPeriod: rule.targetPerPeriod ?? 1,
+        unitName: rule.unitName ?? "次",
+        targetCount: rule.targetCount ?? 10,
+      });
+    }
+    created.push(t);
+  }
+
+  let addedXp = 0;
+  let addedPoints = 0;
+  const seededLogIds: number[] = [];
+  const pushLog = (t: Task, d: Date, ratio: number) => {
+    const minutes = t.mode === "timer" ? t.blockMinutes * ratio : t.mode === "habit" ? 30 : t.mode === "milestone" ? 60 : 20;
+    const xp = Math.round(t.xpPerUnit * ratio);
+    const points = Math.round(t.pointsPerUnit * ratio);
+    const prof = Math.round(t.profPerUnit * ratio);
+    addedXp += xp;
+    addedPoints += points;
+    doc.logs.push({
+      id: nextId("logs"),
+      userId,
+      taskId: t.id,
+      taskTitle: t.title,
+      category: t.category,
+      mode: t.mode,
+      kind: t.mode === "timer" ? "block" : t.mode === "habit" ? "checkin" : t.mode === "milestone" ? "milestone" : "count",
+      day: dateKey(d),
+      xp,
+      points,
+      prof,
+      minutes,
+      ratio,
+      note: "演示数据",
+      createdAt: d.getTime(),
+    });
+    seededLogIds.push(doc.logs[doc.logs.length - 1].id);
+    addProficiency(userId, t.category, prof);
+  };
+
+  for (let i = days; i >= 1; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    for (const t of created) {
+      const spec = DEMO_SPECS.find((s) => s.title === t.title)!;
+      if (rand() > spec.chance) continue;
+      const ratio =
+        t.mode === "timer"
+          ? 1 + (rand() > 0.6 ? 1 : 0)
+          : t.mode === "count"
+            ? 1 + Math.floor(rand() * 2)
+            : t.mode === "milestone"
+              ? 0.2
+              : 1;
+      pushLog(t, d, ratio);
+    }
+  }
+
+  // 让等级稳定落在 Lv.14 区间（totalXpFor(14)=5337，totalXpFor(15)=5937）
+  const academicTimer = created.find((t) => t.mode === "timer" && t.category === "academic")!;
+  let guard = 0;
+  while (addedXp < 5400 && guard++ < 400) {
+    const d = new Date(Date.now() - (1 + Math.floor(rand() * days)) * 86400000);
+    pushLog(academicTimer, d, 1);
+  }
+  // 超出上限时随机移除已生成的演示记录，避免只裁掉最近几天导致图表断档
+  while (addedXp > 5900 && guard++ < 2000 && seededLogIds.length > 0) {
+    const pick = Math.floor(rand() * seededLogIds.length);
+    const [logId] = seededLogIds.splice(pick, 1);
+    const idx = doc.logs.findIndex((l) => l.id === logId);
+    if (idx < 0) continue;
+    const [removed] = doc.logs.splice(idx, 1);
+    addedXp -= removed.xp;
+    addedPoints -= removed.points;
+    addProficiency(userId, removed.category, -removed.prof);
+  }
+
+  const u = getUser(userId)!;
+  u.xp += addedXp;
+  u.points += addedPoints;
+
+  // 习惯任务的连续记录
+  for (const t of created.filter((x) => x.mode === "habit")) {
+    t.streak = 9;
+    t.bestStreak = 12;
+    t.lastPeriodKey = periodKey(t.period as any);
+  }
+  // 里程碑任务：前两个节点已完成
+  const milestoneTask = created.find((t) => t.mode === "milestone");
+  if (milestoneTask) {
+    const ms = parseMilestones(milestoneTask).map((m, i) => ({ ...m, done: i < 2 }));
+    milestoneTask.milestones = JSON.stringify(ms);
+  }
+  // 计件任务：累计进度
+  for (const t of created.filter((x) => x.mode === "count")) {
+    t.currentCount = doc.logs
+      .filter((l) => l.taskId === t.id)
+      .reduce((a, l) => a + Math.max(1, Math.round(l.ratio)), 0);
+  }
+
+  const newAchievements = checkAchievements(userId);
+
+  // 成长树：解锁学术分支前两个节点（真实扣除积分）
+  const nodes = ["academic_1", "academic_2"];
+  for (const nodeId of nodes) {
+    const node = SKILL_NODES.find((n) => n.id === nodeId)!;
+    const prof = getProficiency(userId)[node.category] ?? 0;
+    if (unlockedNodes(userId).includes(nodeId)) continue;
+    if (prof >= node.profRequired && u.points >= node.cost) {
+      u.points -= node.cost;
+      doc.skillNodes.push({ id: nextId("skillNodes"), userId, nodeId, unlockedAt: Date.now() });
+    }
+  }
+
+  await persist();
+  return {
+    ok: true,
+    addedXp,
+    addedPoints,
+    logs: allLogs(userId).length,
+    level: levelFromXp(u.xp),
+    achievements: unlockedAchievementIds(userId).length,
+    skillNodes: unlockedNodes(userId).length,
+    newAchievements,
+  };
+}
+
+/** 登录页一键体验：创建演示账号并载入演示数据 */
+export async function createDemoAccount() {
+  await ensureLoaded();
+  let username = "yunlong";
+  let n = 1;
+  while (getUserByUsername(username)) username = `yunlong${++n}`;
+  const user = await createUserRecord({
+    username,
+    password: "grow2026",
+    displayName: "演示账号",
+    securityQuestion: "我的第一位导师姓什么？",
+    securityAnswer: "张",
+  });
+  const token = await createSession(user.id, true);
+  const seeded = await seedDemoData();
+  return { user: await publicUser(user.id), token, username, password: "grow2026", seeded };
+}

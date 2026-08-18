@@ -1,0 +1,303 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============ 浅色模式：书房纸面 ============ */
+:root {
+  --button-outline: rgba(24, 32, 46, 0.12);
+  --badge-outline: rgba(24, 32, 46, 0.06);
+  --opaque-button-border-intensity: -8;
+  --elevate-1: rgba(24, 32, 46, 0.035);
+  --elevate-2: rgba(24, 32, 46, 0.08);
+
+  --background: 40 30% 96%;
+  --foreground: 220 30% 14%;
+  --border: 38 16% 84%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 30% 14%;
+  --card-border: 38 16% 88%;
+  --sidebar: 40 24% 93%;
+  --sidebar-foreground: 220 30% 16%;
+  --sidebar-border: 38 16% 85%;
+  --sidebar-primary: 210 82% 42%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 40 22% 88%;
+  --sidebar-accent-foreground: 220 30% 14%;
+  --sidebar-ring: 210 82% 42%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 220 30% 14%;
+  --popover-border: 38 16% 86%;
+  --primary: 210 82% 42%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 40 20% 90%;
+  --secondary-foreground: 220 30% 16%;
+  --muted: 40 20% 91%;
+  --muted-foreground: 220 12% 40%;
+  --accent: 40 22% 89%;
+  --accent-foreground: 220 30% 14%;
+  --destructive: 0 68% 44%;
+  --destructive-foreground: 0 0% 100%;
+  --input: 38 16% 78%;
+  --ring: 210 82% 42%;
+  --success: 152 56% 34%;
+  --success-foreground: 0 0% 100%;
+  --warn: 32 84% 42%;
+
+  --cat-academic: 232 58% 48%;
+  --cat-language: 172 58% 34%;
+  --cat-life: 28 76% 44%;
+  --cat-social: 340 62% 48%;
+  --cat-finance: 40 76% 38%;
+
+  --chart-1: 232 58% 48%;
+  --chart-2: 172 58% 34%;
+  --chart-3: 28 76% 44%;
+  --chart-4: 340 62% 48%;
+  --chart-5: 40 76% 38%;
+
+  --font-sans: 'Noto Sans SC', 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-serif: 'Noto Serif SC', Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+  --radius: 0.625rem;
+  --shadow-sm: 0 1px 2px hsl(220 30% 14% / 0.06);
+  --shadow-md: 0 2px 8px hsl(220 30% 14% / 0.07);
+  --shadow-lg: 0 8px 24px hsl(220 30% 14% / 0.09);
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+/* ============ 深色模式：墨蓝书房（第一优先） ============ */
+.dark {
+  --button-outline: rgba(255, 255, 255, 0.1);
+  --badge-outline: rgba(255, 255, 255, 0.06);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255, 255, 255, 0.04);
+  --elevate-2: rgba(255, 255, 255, 0.09);
+
+  --background: 220 24% 8%;
+  --foreground: 210 20% 94%;
+  --border: 220 16% 20%;
+  --card: 220 20% 12%;
+  --card-foreground: 210 20% 94%;
+  --card-border: 220 16% 19%;
+  --sidebar: 220 24% 10%;
+  --sidebar-foreground: 210 18% 90%;
+  --sidebar-border: 220 16% 18%;
+  --sidebar-primary: 210 90% 62%;
+  --sidebar-primary-foreground: 220 40% 10%;
+  --sidebar-accent: 220 18% 18%;
+  --sidebar-accent-foreground: 210 20% 96%;
+  --sidebar-ring: 210 90% 62%;
+  --popover: 220 20% 14%;
+  --popover-foreground: 210 20% 94%;
+  --popover-border: 220 16% 22%;
+  --primary: 210 90% 62%;
+  --primary-foreground: 220 40% 10%;
+  --secondary: 220 16% 20%;
+  --secondary-foreground: 210 20% 94%;
+  --muted: 220 16% 18%;
+  --muted-foreground: 215 14% 68%;
+  --accent: 220 18% 20%;
+  --accent-foreground: 210 20% 96%;
+  --destructive: 2 62% 52%;
+  --destructive-foreground: 0 0% 100%;
+  --input: 220 14% 30%;
+  --ring: 210 90% 62%;
+  --success: 152 60% 45%;
+  --success-foreground: 220 40% 10%;
+  --warn: 36 88% 62%;
+
+  --cat-academic: 232 70% 66%;
+  --cat-language: 172 62% 50%;
+  --cat-life: 28 84% 60%;
+  --cat-social: 340 72% 64%;
+  --cat-finance: 44 88% 58%;
+
+  --chart-1: 232 70% 66%;
+  --chart-2: 172 62% 50%;
+  --chart-3: 28 84% 60%;
+  --chart-4: 340 72% 64%;
+  --chart-5: 44 88% 58%;
+
+  --shadow-sm: 0 1px 2px hsl(220 40% 3% / 0.4);
+  --shadow-md: 0 2px 10px hsl(220 40% 3% / 0.45);
+  --shadow-lg: 0 10px 30px hsl(220 40% 3% / 0.5);
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+    font-feature-settings: 'tnum' on;
+    overflow-wrap: break-word;
+    word-break: normal;
+    line-break: strict;
+  }
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  .text-success {
+    color: hsl(var(--success));
+  }
+  .bg-success {
+    background-color: hsl(var(--success));
+  }
+  .text-warn {
+    color: hsl(var(--warn));
+  }
+  .paper-grain {
+    background-image: radial-gradient(hsl(var(--foreground) / 0.045) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+  .glow-primary {
+    box-shadow: 0 0 0 1px hsl(var(--primary) / 0.4), 0 0 18px hsl(var(--primary) / 0.25);
+  }
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 8px;
+  }
+  input[type='search']::-webkit-search-cancel-button {
+    @apply hidden;
+  }
+  .no-default-hover-elevate {
+  }
+  .no-default-active-elevate {
+  }
+  .toggle-elevate::before,
+  .toggle-elevate-2::before {
+    content: '';
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    border-radius: inherit;
+    z-index: -1;
+  }
+  .toggle-elevate.toggle-elevated::before {
+    background-color: var(--elevate-2);
+  }
+  .border.toggle-elevate::before {
+    inset: -1px;
+  }
+  .hover-elevate:not(.no-default-hover-elevate),
+  .active-elevate:not(.no-default-active-elevate),
+  .hover-elevate-2:not(.no-default-hover-elevate),
+  .active-elevate-2:not(.no-default-active-elevate) {
+    position: relative;
+    z-index: 0;
+  }
+  .hover-elevate:not(.no-default-hover-elevate)::after,
+  .active-elevate:not(.no-default-active-elevate)::after,
+  .hover-elevate-2:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:not(.no-default-active-elevate)::after {
+    content: '';
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    border-radius: inherit;
+    z-index: 999;
+  }
+  .hover-elevate:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-1);
+  }
+  .hover-elevate-2:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-2);
+  }
+  .border.hover-elevate::after,
+  .border.active-elevate::after,
+  .border.hover-elevate-2::after,
+  .border.active-elevate-2::after {
+    inset: -1px;
+  }
+}
+
+/* 成就解锁庆祝 */
+@keyframes ach-pop {
+  0% {
+    transform: scale(0.7) rotateY(-90deg);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.04) rotateY(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) rotateY(0deg);
+    opacity: 1;
+  }
+}
+@keyframes halo {
+  0% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0.5);
+  }
+  100% {
+    box-shadow: 0 0 0 42px hsl(var(--primary) / 0);
+  }
+}
+@keyframes float-up {
+  0% {
+    transform: translateY(6px);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-42px);
+    opacity: 0;
+  }
+}
+@keyframes draw-line {
+  from {
+    stroke-dashoffset: var(--len, 200);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.ach-pop {
+  animation: ach-pop 620ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.halo::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  animation: halo 1200ms ease-out forwards;
+}
+.float-up {
+  animation: float-up 1400ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
