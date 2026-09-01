@@ -1,6 +1,8 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { apiRequest, queryClient, setAuthToken, setUnauthorizedHandler } from "./queryClient";
 import { restoreSession, isStorageAvailable } from "./localdb";
+import { currentCloudUser, cloudSignOut } from "./cloud-auth";
+import { markLocalMode, refreshSyncStatus, setSyncInvalidator, startSyncLoop, syncNow } from "./sync";
 import { toast } from "@/hooks/use-toast";
 import { AlertTriangle, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -18,6 +20,8 @@ export type SessionUser = {
   aiModel: string;
   aiKeyMasked: string;
   securityQuestion?: string;
+  cloudUserId?: string | null;
+  email?: string;
 };
 
 type Ctx = {
@@ -32,6 +36,8 @@ type Ctx = {
   booting: boolean;
   /** 浏览器本地存储（IndexedDB）是否可用 */
   storageOk: boolean;
+  /** 当前账号是否已接入云端同步 */
+  isCloud: boolean;
 };
 
 const AppContext = createContext<Ctx | null>(null);
@@ -55,9 +61,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const res = await restoreSession();
         if (cancelled) return;
         if (res.user) {
+          const u = res.user as SessionUser;
+          // 云端账号：本机会话还在，但云端 session 已失效（未勾选「记住登录状态」）→ 回到登录页
+          if (u.cloudUserId) {
+            const cloud = await currentCloudUser();
+            if (cancelled) return;
+            if (!cloud || cloud.id !== u.cloudUserId) {
+              setAuthToken(null);
+              return;
+            }
+          }
           setAuthToken(res.token);
-          setUserState(res.user as SessionUser);
-          const t = (res.user as SessionUser).theme;
+          setUserState(u);
+          const t = u.theme;
           if (t === "light" || t === "dark") setThemeState(t);
         }
       } catch {
@@ -94,6 +110,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (u?.theme === "light" || u?.theme === "dark") setThemeState(u.theme);
   }
 
+  // 同步引擎：登录云端账号后启动后台同步；本地模式只显示「本地模式」
+  useEffect(() => {
+    if (booting) return;
+    setSyncInvalidator(() => {
+      queryClient.invalidateQueries();
+    });
+    if (user?.cloudUserId) {
+      void refreshSyncStatus().then(() => startSyncLoop());
+    } else {
+      markLocalMode();
+    }
+    return () => setSyncInvalidator(null);
+  }, [booting, user?.cloudUserId]);
+
   function setSession(u: SessionUser | null, token: string | null) {
     setAuthToken(token);
     setUser(u);
@@ -108,15 +138,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }
 
   function logout() {
+    const wasCloud = !!user?.cloudUserId;
+    if (wasCloud) {
+      // 尽力先把队列推完，再登出，避免离线记录留在本机
+      void syncNow()
+        .catch(() => {})
+        .finally(() => void cloudSignOut());
+    }
     apiRequest("POST", "/api/logout").catch(() => {});
     setAuthToken(null);
     setUserState(null);
+    markLocalMode();
     queryClient.clear();
   }
 
   return (
     <AppContext.Provider
-      value={{ user, setUser, setSession, theme, setTheme, logout, booting, storageOk }}
+      value={{ user, setUser, setSession, theme, setTheme, logout, booting, storageOk, isCloud: !!user?.cloudUserId }}
     >
       {children}
     </AppContext.Provider>

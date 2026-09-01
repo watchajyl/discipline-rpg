@@ -103,6 +103,28 @@ type DbDoc = {
   upkeepDays: UpkeepDay[];
   upkeepExemptions: UpkeepExemption[];
   upkeepConfigs: UpkeepConfigRow[];
+  // ---- V2 云端同步 ----
+  /** 待上传队列（按入队顺序推送，(table,pk) 去重） */
+  outbox: OutboxEntry[];
+  /** 已成功推送的行内容指纹：pushed[table][pk] = hash */
+  pushed: Record<string, Record<string, string>>;
+  /** 每张表的增量拉取游标（ISO 时间戳） */
+  cursors: Record<string, string>;
+  /** 每个云账号最近一次同步成功时间 */
+  lastSyncAt: Record<string, number>;
+};
+
+export type OutboxEntry = {
+  seq: number;
+  /** 云端表名 */
+  table: string;
+  /** 主键（uuid 或 "day" / "achievementId" 之类的自然键） */
+  pk: string;
+  /** 所属云账号 uuid */
+  cloudUserId: string;
+  createdAt: number;
+  tries: number;
+  lastError?: string;
 };
 
 function emptyDoc(): DbDoc {
@@ -125,6 +147,10 @@ function emptyDoc(): DbDoc {
     upkeepDays: [],
     upkeepExemptions: [],
     upkeepConfigs: [],
+    outbox: [],
+    pushed: {},
+    cursors: {},
+    lastSyncAt: {},
   };
 }
 
@@ -156,6 +182,10 @@ export async function ensureLoaded(): Promise<void> {
         if (!Array.isArray(doc.upkeepDays)) doc.upkeepDays = [];
         if (!Array.isArray(doc.upkeepExemptions)) doc.upkeepExemptions = [];
         if (!Array.isArray(doc.upkeepConfigs)) doc.upkeepConfigs = [];
+        if (!Array.isArray(doc.outbox)) doc.outbox = [];
+        if (!doc.pushed) doc.pushed = {};
+        if (!doc.cursors) doc.cursors = {};
+        if (!doc.lastSyncAt) doc.lastSyncAt = {};
       } catch {
         doc = emptyDoc();
       }
@@ -170,6 +200,12 @@ export async function ensureLoaded(): Promise<void> {
 
 /** 串行化写入，避免并发结算互相覆盖 */
 function persist(): Promise<void> {
+  // 每次落盘前把「本地已改、云端还没有」的行推进 outbox（乐观更新已经先发生了）
+  try {
+    enqueueDirtyRows();
+  } catch {
+    /* 同步层任何问题都不能影响本地写入 */
+  }
   const snapshot = JSON.stringify(doc);
   writeChain = writeChain.then(() => writeDoc(snapshot)).catch(() => undefined);
   return writeChain;
@@ -278,11 +314,15 @@ function addProficiency(userId: number, category: string, delta: number) {
 }
 
 function listTasks(userId: number): Task[] {
-  return doc.tasks.filter((t) => t.userId === userId).sort((a, b) => b.createdAt - a.createdAt);
+  return doc.tasks.filter((t) => t.userId === userId && !t.deletedAt).sort((a, b) => b.createdAt - a.createdAt);
 }
 
 function getTask(id: number): Task | undefined {
-  return doc.tasks.find((t) => t.id === id);
+  return doc.tasks.find((t) => t.id === id && !t.deletedAt);
+}
+
+function listRewards(userId: number): Reward[] {
+  return doc.rewards.filter((r) => r.userId === userId && !r.deletedAt);
 }
 
 function allLogs(userId: number): Log[] {
@@ -419,6 +459,8 @@ async function publicUser(id: number) {
     aiModel: u.aiModel,
     aiKeyMasked: maskKey(plainKey),
     securityQuestion: u.securityQuestion,
+    cloudUserId: u.cloudUserId ?? null,
+    email: u.email ?? "",
   };
 }
 
@@ -849,8 +891,9 @@ export async function deleteTask(id: number) {
   const userId = requireUserId();
   const t = getTask(id);
   if (!t || t.userId !== userId) throw new LocalError("任务不存在", 404);
-  doc.tasks = doc.tasks.filter((x) => x.id !== id);
-  doc.logs = doc.logs.filter((l) => l.taskId !== id);
+  // 软删墓碑：同步需要墓碑，且结算日志是只追加的（删任务不回收已得数值）
+  t.deletedAt = Date.now();
+  t.updatedAt = t.deletedAt;
   doc.timers = doc.timers.filter((x) => x.taskId !== id);
   await persist();
   return { ok: true };
@@ -1288,7 +1331,7 @@ export async function unlockSkillNode(nodeId: string) {
 export async function getRewards() {
   await ensureLoaded();
   const userId = requireUserId();
-  return doc.rewards.filter((r) => r.userId === userId).sort((a, b) => a.cost - b.cost);
+  return listRewards(userId).sort((a, b) => a.cost - b.cost);
 }
 
 export async function createReward(input: unknown) {
@@ -1307,7 +1350,7 @@ export async function updateReward(id: number, input: unknown) {
   const userId = requireUserId();
   const parsed = insertRewardSchema.partial().safeParse(input ?? {});
   if (!parsed.success) throw new LocalError("参数有误");
-  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  const reward = listRewards(userId).find((r) => r.id === id);
   if (!reward) throw new LocalError("奖励不存在", 404);
   Object.assign(reward, parsed.data);
   await persist();
@@ -1317,9 +1360,10 @@ export async function updateReward(id: number, input: unknown) {
 export async function deleteReward(id: number) {
   await ensureLoaded();
   const userId = requireUserId();
-  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  const reward = listRewards(userId).find((r) => r.id === id);
   if (!reward) throw new LocalError("奖励不存在", 404);
-  doc.rewards = doc.rewards.filter((r) => r.id !== id);
+  reward.deletedAt = Date.now();
+  reward.updatedAt = reward.deletedAt;
   await persist();
   return { ok: true };
 }
@@ -1327,7 +1371,7 @@ export async function deleteReward(id: number) {
 export async function redeemReward(id: number) {
   await ensureLoaded();
   const userId = requireUserId();
-  const reward = doc.rewards.find((r) => r.id === id && r.userId === userId);
+  const reward = listRewards(userId).find((r) => r.id === id);
   if (!reward) throw new LocalError("奖励不存在", 404);
   if (reward.stock === 0) throw new LocalError("库存已用完");
   const user = getUser(userId)!;
@@ -1393,7 +1437,7 @@ export async function exportData() {
     logs: allLogs(userId),
     achievements: unlockedAchievementIds(userId),
     skillNodes: unlockedNodes(userId),
-    rewards: doc.rewards.filter((r) => r.userId === userId),
+    rewards: listRewards(userId),
     redemptions: doc.redemptions.filter((r) => r.userId === userId),
     upkeepDays: doc.upkeepDays.filter((r) => r.userId === userId),
     upkeepExemptions: doc.upkeepExemptions.filter((r) => r.userId === userId),
@@ -2424,4 +2468,625 @@ export const __upkeepDev = {
 
 if (typeof window !== "undefined") {
   (window as any).__upkeepDev = __upkeepDev;
+}
+
+// ============================================================
+// V2 云端同步层（SPEC-V2 第一章）
+//
+// 设计要点：
+//   1) 离线优先：UI 永远读本地 doc；写操作先本地 + 乐观更新，
+//      persist() 时把「本地已改、云端还没有」的行推进 outbox 队列。
+//   2) outbox 按 (table, pk) 去重，重复操作只会留一条 → 联网补传绝不重复计分。
+//   3) 只追加表（结算/兑换/维持/成就/成长树）按主键去重合并，永不覆盖；
+//      profiles / tasks / rewards 走 last-write-wins by updated_at，删除用软删墓碑。
+//   4) 合并完成后调用 reprojectUser()，由 projectState() 纯函数重算
+//      xp / points / proficiency / level，保证多设备最终一致。
+// ============================================================
+import { projectState } from "@shared/projection";
+import {
+  achievementToCloud,
+  APPEND_ONLY,
+  CLOUD_TABLES,
+  logFromCloud,
+  logToCloud,
+  redemptionFromCloud,
+  redemptionToCloud,
+  rewardFromCloud,
+  rewardToCloud,
+  skillNodeToCloud,
+  taskFromCloud,
+  taskToCloud,
+  toIso,
+  fromIso,
+  upkeepDayFromCloud,
+  upkeepDayToCloud,
+  type CloudTable,
+} from "./cloud-map";
+
+// ---------------- 基础工具 ----------------
+export function newUid(): string {
+  const c: any = globalThis.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `${randomHex(8)}-${randomHex(2)}-4${randomHex(2).slice(1)}-a${randomHex(2).slice(1)}-${randomHex(6)}`;
+}
+
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h.toString(36);
+}
+
+/** 行内容指纹（刻意不含 updatedAt，避免「刚拉下来就又变脏」） */
+function contentHash(obj: unknown): string {
+  return fnv1a(JSON.stringify(obj, (k, v) => (k === "updatedAt" ? undefined : v)));
+}
+
+const CURSOR_COL: Record<CloudTable, string> = {
+  profiles: "updated_at",
+  tasks: "updated_at",
+  rewards: "updated_at",
+  settlement_logs: "created_at",
+  redemptions: "redeemed_at",
+  achievements_unlocked: "unlocked_at",
+  skill_nodes_unlocked: "unlocked_at",
+  upkeep_days: "settled_at",
+};
+
+const CONFLICT_KEY: Record<CloudTable, string> = {
+  profiles: "user_id",
+  tasks: "id",
+  rewards: "id",
+  settlement_logs: "id",
+  redemptions: "id",
+  achievements_unlocked: "user_id,achievement_id",
+  skill_nodes_unlocked: "user_id,node_id",
+  upkeep_days: "user_id,day",
+};
+
+// ---------------- 云账号绑定 ----------------
+export function cloudUserIdOf(userId: number): string | null {
+  return getUser(userId)?.cloudUserId ?? null;
+}
+
+/** 当前登录的本地账号是否为云端账号 */
+export function activeCloudUserId(): string | null {
+  const s = getSession(authToken);
+  if (!s) return null;
+  return cloudUserIdOf(s.userId);
+}
+
+function activeLocalUserId(): number | null {
+  const s = getSession(authToken);
+  return s ? s.userId : null;
+}
+
+/** 同步引擎入口：当前登录账号的本地 id 与云端 id */
+export async function activeUserIds(): Promise<{ localId: number; cloudId: string } | null> {
+  await ensureLoaded();
+  const localId = activeLocalUserId();
+  if (localId == null) return null;
+  const cloudId = cloudUserIdOf(localId);
+  if (!cloudId) return null;
+  return { localId, cloudId };
+}
+
+// ---------------- uid 回填 ----------------
+function backfillUids(userId: number) {
+  for (const t of doc.tasks) if (t.userId === userId && !t.uid) t.uid = newUid();
+  for (const r of doc.rewards) if (r.userId === userId && !r.uid) r.uid = newUid();
+  for (const l of doc.logs) if (l.userId === userId && !l.uid) l.uid = newUid();
+  for (const r of doc.redemptions) if (r.userId === userId && !r.uid) r.uid = newUid();
+}
+
+// ---------------- 行枚举 ----------------
+type DirtyRow = { table: CloudTable; pk: string; hash: string };
+
+function enumerateRows(userId: number, cloudId: string): DirtyRow[] {
+  const out: DirtyRow[] = [];
+  const u = getUser(userId);
+  if (!u) return out;
+  out.push({ table: "profiles", pk: cloudId, hash: contentHash(profileToCloud(userId, cloudId)) });
+  for (const t of doc.tasks) if (t.userId === userId && t.uid) out.push({ table: "tasks", pk: t.uid, hash: contentHash(taskToCloud(t, cloudId)) });
+  for (const r of doc.rewards) if (r.userId === userId && r.uid) out.push({ table: "rewards", pk: r.uid, hash: contentHash(rewardToCloud(r, cloudId)) });
+  for (const l of doc.logs) if (l.userId === userId && l.uid) out.push({ table: "settlement_logs", pk: l.uid, hash: "a" });
+  for (const r of doc.redemptions) if (r.userId === userId && r.uid) out.push({ table: "redemptions", pk: r.uid, hash: "a" });
+  for (const a of doc.achievements) if (a.userId === userId) out.push({ table: "achievements_unlocked", pk: a.achievementId, hash: "a" });
+  for (const n of doc.skillNodes) if (n.userId === userId) out.push({ table: "skill_nodes_unlocked", pk: n.nodeId, hash: "a" });
+  for (const d of doc.upkeepDays) if (d.userId === userId && !d.deletedAt) out.push({ table: "upkeep_days", pk: d.day, hash: "a" });
+  return out;
+}
+
+/** persist() 的钩子：把变脏的行入队。同步层出错绝不影响本地写入。 */
+function enqueueDirtyRows() {
+  const localId = activeLocalUserId();
+  if (localId == null) return;
+  const cloudId = cloudUserIdOf(localId);
+  if (!cloudId) return; // 本地模式不入队
+  backfillUids(localId);
+  const now = Date.now();
+  const queued = new Set(doc.outbox.map((e) => `${e.table}::${e.pk}`));
+  let seq = doc.outbox.reduce((a, e) => Math.max(a, e.seq), 0);
+  for (const row of enumerateRows(localId, cloudId)) {
+    const known = doc.pushed[row.table]?.[row.pk];
+    if (known === row.hash) continue;
+    // 可变表：内容变了就刷新 updatedAt（last-write-wins 依据）
+    if (row.table === "tasks") {
+      const t = doc.tasks.find((x) => x.uid === row.pk);
+      if (t) t.updatedAt = now;
+    } else if (row.table === "rewards") {
+      const r = doc.rewards.find((x) => x.uid === row.pk);
+      if (r) r.updatedAt = now;
+    }
+    const key = `${row.table}::${row.pk}`;
+    if (queued.has(key)) continue;
+    queued.add(key);
+    doc.outbox.push({ seq: ++seq, table: row.table, pk: row.pk, cloudUserId: cloudId, createdAt: now, tries: 0 });
+  }
+}
+
+// ---------------- profiles ----------------
+function profileToCloud(userId: number, cloudId: string) {
+  const u = getUser(userId)!;
+  const pend = doc.upkeepExemptions
+    .filter((e) => e.userId === userId && !e.deletedAt)
+    .map((e) => ({ day: e.day, category: e.category, createdAt: e.createdAt }))
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.category < b.category ? -1 : 1));
+  return {
+    user_id: cloudId,
+    display_name: u.displayName,
+    theme: u.theme,
+    // 只同步 base_url / model —— AI API Key 绝不上云
+    ai_config: { base_url: u.aiBaseUrl, model: u.aiModel },
+    upkeep_config: getUpkeepConfig(userId),
+    settings: { pendingExemptions: pend, createdAt: u.createdAt },
+    timezone: getUpkeepConfig(userId).timezone,
+    last_backup_at: toIso(doc.lastBackupAt[String(userId)] ?? null),
+  };
+}
+
+function profileFromCloud(userId: number, row: any) {
+  const u = getUser(userId);
+  if (!u) return;
+  if (typeof row.display_name === "string" && row.display_name) u.displayName = row.display_name;
+  if (row.theme === "dark" || row.theme === "light") u.theme = row.theme;
+  const ai = row.ai_config ?? {};
+  if (typeof ai.base_url === "string" && ai.base_url) u.aiBaseUrl = ai.base_url;
+  if (typeof ai.model === "string" && ai.model) u.aiModel = ai.model;
+  if (row.upkeep_config && Object.keys(row.upkeep_config).length) {
+    writeUpkeepConfig(userId, normalizeUpkeepConfig(row.upkeep_config));
+  }
+  const pend = (row.settings ?? {}).pendingExemptions;
+  if (Array.isArray(pend)) {
+    for (const e of pend) {
+      if (!e?.day || !e?.category) continue;
+      const exists = doc.upkeepExemptions.some((x) => x.userId === userId && x.day === e.day && x.category === e.category);
+      if (exists) continue;
+      doc.upkeepExemptions.push({
+        id: nextId("upkeepExemptions"),
+        userId,
+        day: e.day,
+        category: e.category,
+        createdAt: e.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+        deletedAt: null,
+      });
+    }
+  }
+  const lb = fromIso(row.last_backup_at, 0);
+  if (lb) doc.lastBackupAt[String(userId)] = Math.max(doc.lastBackupAt[String(userId)] ?? 0, lb);
+}
+
+// ---------------- 数值重算（SPEC-V2 1.4） ----------------
+export function reprojectUser(userId: number): { xp: number; points: number } {
+  const u = getUser(userId);
+  if (!u) return { xp: 0, points: 0 };
+  const s = projectState(
+    doc.logs.filter((l) => l.userId === userId),
+    doc.redemptions.filter((r) => r.userId === userId),
+    doc.upkeepDays.filter((d) => d.userId === userId && !d.deletedAt),
+    doc.skillNodes.filter((n) => n.userId === userId),
+    doc.achievements.filter((a) => a.userId === userId),
+  );
+  u.xp = s.xp;
+  u.points = s.points;
+  for (const c of CATEGORY_KEYS) {
+    const row = doc.proficiency.find((p) => p.userId === userId && p.category === c);
+    if (row) row.value = s.proficiency[c] ?? 0;
+    else doc.proficiency.push({ id: nextId("proficiency"), userId, category: c, value: s.proficiency[c] ?? 0 });
+  }
+  return { xp: s.xp, points: s.points };
+}
+
+// ---------------- 推送用的行序列化 ----------------
+export function buildPushRow(table: CloudTable, pk: string, userId: number, cloudId: string): any | null {
+  switch (table) {
+    case "profiles":
+      return profileToCloud(userId, cloudId);
+    case "tasks": {
+      const t = doc.tasks.find((x) => x.userId === userId && x.uid === pk);
+      return t ? taskToCloud(t, cloudId) : null;
+    }
+    case "rewards": {
+      const r = doc.rewards.find((x) => x.userId === userId && x.uid === pk);
+      return r ? rewardToCloud(r, cloudId) : null;
+    }
+    case "settlement_logs": {
+      const l = doc.logs.find((x) => x.userId === userId && x.uid === pk);
+      if (!l) return null;
+      const task = doc.tasks.find((t) => t.id === l.taskId && t.userId === userId);
+      return logToCloud(l, cloudId, task?.uid ?? null);
+    }
+    case "redemptions": {
+      const r = doc.redemptions.find((x) => x.userId === userId && x.uid === pk);
+      if (!r) return null;
+      const rw = doc.rewards.find((x) => x.id === r.rewardId && x.userId === userId);
+      return redemptionToCloud(r, cloudId, rw?.uid ?? null);
+    }
+    case "achievements_unlocked": {
+      const a = doc.achievements.find((x) => x.userId === userId && x.achievementId === pk);
+      return a ? achievementToCloud(a, cloudId) : null;
+    }
+    case "skill_nodes_unlocked": {
+      const n = doc.skillNodes.find((x) => x.userId === userId && x.nodeId === pk);
+      if (!n) return null;
+      const node = SKILL_NODES.find((x) => x.id === n.nodeId);
+      return skillNodeToCloud({ ...n, cost: n.cost ?? node?.cost ?? 0 }, cloudId);
+    }
+    case "upkeep_days": {
+      const d = doc.upkeepDays.find((x) => x.userId === userId && x.day === pk && !x.deletedAt);
+      return d ? upkeepDayToCloud(d, cloudId) : null;
+    }
+  }
+  return null;
+}
+
+// ---------------- 合并云端行 ----------------
+export function mergeCloudRows(userId: number, table: CloudTable, rows: any[]): number {
+  let applied = 0;
+  for (const row of rows) {
+    switch (table) {
+      case "profiles": {
+        profileFromCloud(userId, row);
+        applied++;
+        break;
+      }
+      case "tasks": {
+        const local = doc.tasks.find((t) => t.userId === userId && t.uid === row.id);
+        const cloudAt = fromIso(row.updated_at, 0);
+        if (!local) {
+          doc.tasks.push(taskFromCloud(row, nextId("tasks"), userId));
+          applied++;
+        } else if (cloudAt >= (local.updatedAt ?? 0)) {
+          // last-write-wins by updated_at（含 deleted_at 墓碑）
+          Object.assign(local, taskFromCloud(row, local.id, userId));
+          applied++;
+        }
+        break;
+      }
+      case "rewards": {
+        const local = doc.rewards.find((r) => r.userId === userId && r.uid === row.id);
+        const cloudAt = fromIso(row.updated_at, 0);
+        if (!local) {
+          doc.rewards.push(rewardFromCloud(row, nextId("rewards"), userId));
+          applied++;
+        } else if (cloudAt >= (local.updatedAt ?? 0)) {
+          Object.assign(local, rewardFromCloud(row, local.id, userId));
+          applied++;
+        }
+        break;
+      }
+      case "settlement_logs": {
+        if (doc.logs.some((l) => l.userId === userId && l.uid === row.id)) break; // 主键去重，永不覆盖
+        const task = row.task_id ? doc.tasks.find((t) => t.userId === userId && t.uid === row.task_id) : undefined;
+        doc.logs.push(logFromCloud(row, nextId("logs"), userId, task?.id ?? 0));
+        applied++;
+        break;
+      }
+      case "redemptions": {
+        if (doc.redemptions.some((r) => r.userId === userId && r.uid === row.id)) break;
+        const rw = row.reward_id ? doc.rewards.find((x) => x.userId === userId && x.uid === row.reward_id) : undefined;
+        doc.redemptions.push(redemptionFromCloud(row, nextId("redemptions"), userId, rw?.id ?? 0));
+        applied++;
+        break;
+      }
+      case "achievements_unlocked": {
+        if (doc.achievements.some((a) => a.userId === userId && a.achievementId === row.achievement_id)) break;
+        doc.achievements.push({
+          id: nextId("achievements"),
+          userId,
+          achievementId: row.achievement_id,
+          unlockedAt: fromIso(row.unlocked_at, Date.now()),
+        });
+        applied++;
+        break;
+      }
+      case "skill_nodes_unlocked": {
+        if (doc.skillNodes.some((n) => n.userId === userId && n.nodeId === row.node_id)) break;
+        doc.skillNodes.push({
+          id: nextId("skillNodes"),
+          userId,
+          nodeId: row.node_id,
+          cost: row.cost ?? 0,
+          unlockedAt: fromIso(row.unlocked_at, Date.now()),
+        });
+        applied++;
+        break;
+      }
+      case "upkeep_days": {
+        if (doc.upkeepDays.some((d) => d.userId === userId && d.day === row.day)) break; // (user,day) 幂等
+        doc.upkeepDays.push(upkeepDayFromCloud(row, userId));
+        applied++;
+        break;
+      }
+    }
+  }
+  return applied;
+}
+
+// ---------------- outbox 维护 ----------------
+export function outboxEntries(cloudId: string): OutboxEntry[] {
+  return doc.outbox.filter((e) => e.cloudUserId === cloudId).sort((a, b) => a.seq - b.seq);
+}
+
+export function outboxCount(cloudId: string | null): number {
+  if (!cloudId) return 0;
+  return doc.outbox.filter((e) => e.cloudUserId === cloudId).length;
+}
+
+export function markPushed(userId: number, cloudId: string, entries: { table: CloudTable; pk: string }[]) {
+  for (const e of entries) {
+    const hash =
+      e.table === "profiles"
+        ? contentHash(profileToCloud(userId, cloudId))
+        : e.table === "tasks"
+          ? contentHash(taskToCloud(doc.tasks.find((t) => t.uid === e.pk)!, cloudId))
+          : e.table === "rewards"
+            ? contentHash(rewardToCloud(doc.rewards.find((r) => r.uid === e.pk)!, cloudId))
+            : "a";
+    if (!doc.pushed[e.table]) doc.pushed[e.table] = {};
+    doc.pushed[e.table][e.pk] = hash;
+  }
+  const drop = new Set(entries.map((e) => `${e.table}::${e.pk}`));
+  doc.outbox = doc.outbox.filter((e) => !(e.cloudUserId === cloudId && drop.has(`${e.table}::${e.pk}`)));
+}
+
+export function markPushFailed(cloudId: string, table: CloudTable, message: string) {
+  for (const e of doc.outbox) {
+    if (e.cloudUserId === cloudId && e.table === table) {
+      e.tries += 1;
+      e.lastError = message.slice(0, 200);
+    }
+  }
+}
+
+/** 拉取合并后记录指纹，避免刚合并进来的行又被判为「本地已改」 */
+export function recordMergedHashes(userId: number, cloudId: string) {
+  for (const row of enumerateRows(userId, cloudId)) {
+    if (!doc.pushed[row.table]) doc.pushed[row.table] = {};
+    if (doc.outbox.some((e) => e.cloudUserId === cloudId && e.table === row.table && e.pk === row.pk)) continue;
+    doc.pushed[row.table][row.pk] = row.hash;
+  }
+}
+
+export function getCursor(cloudId: string, table: CloudTable): string {
+  return doc.cursors[`${cloudId}:${table}`] ?? "1970-01-01T00:00:00.000Z";
+}
+export function setCursor(cloudId: string, table: CloudTable, iso: string) {
+  const cur = doc.cursors[`${cloudId}:${table}`];
+  if (!cur || Date.parse(iso) >= Date.parse(cur)) doc.cursors[`${cloudId}:${table}`] = iso;
+}
+export function cursorColumn(table: CloudTable): string {
+  return CURSOR_COL[table];
+}
+export function conflictKey(table: CloudTable): string {
+  return CONFLICT_KEY[table];
+}
+export function isAppendOnly(table: CloudTable): boolean {
+  return APPEND_ONLY.includes(table);
+}
+export function cloudTables(): readonly CloudTable[] {
+  return CLOUD_TABLES;
+}
+
+export function lastSyncAt(cloudId: string | null): number {
+  return cloudId ? (doc.lastSyncAt[cloudId] ?? 0) : 0;
+}
+export function setLastSyncAt(cloudId: string, at: number) {
+  doc.lastSyncAt[cloudId] = at;
+}
+
+export async function persistNow() {
+  await persist();
+}
+
+/** 「强制以云端为准重新拉取」：清空本机该账号的业务数据与游标后全量重拉 */
+export async function resetLocalForCloud(cloudId: string) {
+  await ensureLoaded();
+  const localId = doc.users.find((u) => u.cloudUserId === cloudId)?.id;
+  if (localId == null) throw new LocalError("未找到对应的本地账号", 404);
+  clearUserData(localId);
+  doc.rewards = doc.rewards.filter((r) => r.userId !== localId);
+  doc.upkeepConfigs = doc.upkeepConfigs.filter((r) => r.userId !== localId);
+  doc.outbox = doc.outbox.filter((e) => e.cloudUserId !== cloudId);
+  for (const t of CLOUD_TABLES) {
+    delete doc.cursors[`${cloudId}:${t}`];
+    if (doc.pushed[t]) doc.pushed[t] = {};
+  }
+  await persist();
+  return { ok: true };
+}
+
+// ---------------- 云端账号的本地镜像账号 ----------------
+export async function attachCloudSession(input: {
+  cloudUserId: string;
+  email: string;
+  displayName?: string;
+  remember?: boolean;
+}): Promise<{ user: any; token: string }> {
+  await ensureLoaded();
+  let user = doc.users.find((u) => u.cloudUserId === input.cloudUserId);
+  if (!user) {
+    user = {
+      id: nextId("users"),
+      username: input.email,
+      cloudUserId: input.cloudUserId,
+      email: input.email,
+      password: "",
+      displayName: input.displayName?.trim() || input.email.split("@")[0],
+      securityQuestion: "",
+      securityAnswer: "",
+      xp: 0,
+      points: 0,
+      theme: "dark",
+      aiBaseUrl: "https://api.deepseek.com/v1",
+      aiApiKey: "",
+      aiModel: "deepseek-chat",
+      createdAt: Date.now(),
+    };
+    doc.users.push(user);
+    for (const c of CATEGORY_KEYS) doc.proficiency.push({ id: nextId("proficiency"), userId: user.id, category: c, value: 0 });
+    for (const r of DEFAULT_REWARDS) {
+      doc.rewards.push({ ...r, id: nextId("rewards"), uid: newUid(), userId: user.id, createdAt: Date.now(), updatedAt: Date.now(), deletedAt: null });
+    }
+  } else {
+    user.email = input.email;
+    user.username = input.email;
+  }
+  purgeExpiredSessions();
+  const token = await createSession(user.id, input.remember !== false);
+  await persist();
+  return { user: await publicUser(user.id), token };
+}
+
+/** 本地模式账号列表（可迁移到云端的候选） */
+export async function localOnlyAccounts() {
+  await ensureLoaded();
+  return doc.users
+    .filter((u) => !u.cloudUserId)
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      displayName: u.displayName,
+      xp: u.xp,
+      points: u.points,
+      tasks: doc.tasks.filter((t) => t.userId === u.id && !t.deletedAt).length,
+      logs: doc.logs.filter((l) => l.userId === u.id).length,
+      upkeepDays: doc.upkeepDays.filter((d) => d.userId === u.id).length,
+      records:
+        doc.tasks.filter((t) => t.userId === u.id && !t.deletedAt).length +
+        doc.logs.filter((l) => l.userId === u.id).length +
+        doc.redemptions.filter((r) => r.userId === u.id).length +
+        doc.upkeepDays.filter((d) => d.userId === u.id).length,
+    }))
+    .filter((a) => a.records > 0);
+}
+
+/** 一键把某个本地模式账号的数据搬到当前云端账号（数值由 projectState 复算，保持不变） */
+export async function migrateLocalAccountToCloud(fromLocalUserId: number) {
+  await ensureLoaded();
+  const targetId = requireUserId();
+  const target = getUser(targetId)!;
+  if (!target.cloudUserId) throw new LocalError("请先登录云端账号");
+  const source = getUser(fromLocalUserId);
+  if (!source) throw new LocalError("本地数据不存在", 404);
+  if (source.id === targetId) throw new LocalError("不能迁移到自己");
+  const before = { xp: source.xp, points: source.points, proficiency: getProficiency(fromLocalUserId) };
+
+  const taskIdMap = new Map<number, number>();
+  for (const t of doc.tasks.filter((x) => x.userId === fromLocalUserId)) {
+    const id = nextId("tasks");
+    taskIdMap.set(t.id, id);
+    doc.tasks.push({ ...t, id, uid: newUid(), userId: targetId, updatedAt: Date.now(), deletedAt: t.deletedAt ?? null });
+  }
+  const rewardIdMap = new Map<number, number>();
+  for (const r of doc.rewards.filter((x) => x.userId === fromLocalUserId)) {
+    const id = nextId("rewards");
+    rewardIdMap.set(r.id, id);
+    doc.rewards.push({ ...r, id, uid: newUid(), userId: targetId, updatedAt: Date.now(), deletedAt: r.deletedAt ?? null });
+  }
+  for (const l of doc.logs.filter((x) => x.userId === fromLocalUserId)) {
+    doc.logs.push({ ...l, id: nextId("logs"), uid: newUid(), userId: targetId, taskId: taskIdMap.get(l.taskId) ?? 0 });
+  }
+  for (const r of doc.redemptions.filter((x) => x.userId === fromLocalUserId)) {
+    doc.redemptions.push({ ...r, id: nextId("redemptions"), uid: newUid(), userId: targetId, rewardId: rewardIdMap.get(r.rewardId) ?? 0 });
+  }
+  for (const a of doc.achievements.filter((x) => x.userId === fromLocalUserId)) {
+    if (doc.achievements.some((x) => x.userId === targetId && x.achievementId === a.achievementId)) continue;
+    doc.achievements.push({ ...a, id: nextId("achievements"), userId: targetId });
+  }
+  for (const n of doc.skillNodes.filter((x) => x.userId === fromLocalUserId)) {
+    if (doc.skillNodes.some((x) => x.userId === targetId && x.nodeId === n.nodeId)) continue;
+    doc.skillNodes.push({ ...n, id: nextId("skillNodes"), userId: targetId });
+  }
+  for (const d of doc.upkeepDays.filter((x) => x.userId === fromLocalUserId)) {
+    if (doc.upkeepDays.some((x) => x.userId === targetId && x.day === d.day)) continue;
+    doc.upkeepDays.push({ ...d, userId: targetId });
+  }
+  for (const e of doc.upkeepExemptions.filter((x) => x.userId === fromLocalUserId)) {
+    if (doc.upkeepExemptions.some((x) => x.userId === targetId && x.day === e.day && x.category === e.category)) continue;
+    doc.upkeepExemptions.push({ ...e, id: nextId("upkeepExemptions"), userId: targetId });
+  }
+  const srcCfg = doc.upkeepConfigs.find((c) => c.userId === fromLocalUserId);
+  if (srcCfg) writeUpkeepConfig(targetId, normalizeUpkeepConfig(srcCfg.config));
+
+  const after = reprojectUser(targetId);
+  await persist();
+  return {
+    ok: true,
+    before,
+    after: { xp: after.xp, points: after.points, proficiency: getProficiency(targetId) },
+    migrated: {
+      tasks: taskIdMap.size,
+      logs: doc.logs.filter((l) => l.userId === targetId).length,
+      upkeepDays: doc.upkeepDays.filter((d) => d.userId === targetId).length,
+    },
+  };
+}
+
+/** 导入 V1 备份 JSON 到当前账号；云端账号会自动重算并排队上传 */
+export async function importBackupToCloud(payload: any) {
+  await importData(payload);
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  if (u.cloudUserId) {
+    backfillUids(userId);
+    reprojectUser(userId);
+    await persist();
+  }
+  return { ok: true, xp: getUser(userId)!.xp, points: getUser(userId)!.points };
+}
+
+/** 自测用：对比增量维护值与 projectState 重算值 */
+export const __syncDev = {
+  async projectionDiff() {
+    await ensureLoaded();
+    const userId = requireUserId();
+    const u = getUser(userId)!;
+    const before = { xp: u.xp, points: u.points, proficiency: { ...getProficiency(userId) } };
+    const s = projectState(
+      doc.logs.filter((l) => l.userId === userId),
+      doc.redemptions.filter((r) => r.userId === userId),
+      doc.upkeepDays.filter((d) => d.userId === userId && !d.deletedAt),
+      doc.skillNodes.filter((n) => n.userId === userId),
+      doc.achievements.filter((a) => a.userId === userId),
+    );
+    return { incremental: before, projected: { xp: s.xp, points: s.points, proficiency: s.proficiency } };
+  },
+  async outbox() {
+    await ensureLoaded();
+    const cid = activeCloudUserId();
+    return { cloudUserId: cid, entries: cid ? outboxEntries(cid) : [] };
+  },
+  async whoami() {
+    await ensureLoaded();
+    const id = activeLocalUserId();
+    return id == null ? null : { localId: id, cloudUserId: cloudUserIdOf(id), points: getUser(id)!.points, xp: getUser(id)!.xp };
+  },
+};
+
+if (typeof window !== "undefined") {
+  (window as any).__syncDev = __syncDev;
 }

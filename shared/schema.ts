@@ -8,6 +8,10 @@ import { z } from "zod";
 export type User = {
   id: number;
   username: string;
+  /** V2：绑定的 Supabase 账号 uuid；本地模式为 null */
+  cloudUserId?: string | null;
+  /** V2：云端账号邮箱 */
+  email?: string;
   password: string;           // PBKDF2: pbkdf2$210000$salt$hash
   displayName: string;
   securityQuestion: string;
@@ -30,6 +34,12 @@ export type Session = {
 
 export type Task = {
   id: number;
+  /** V2：跨设备稳定主键（uuid），云端 tasks.id */
+  uid?: string;
+  /** V2：last-write-wins 依据 */
+  updatedAt?: number;
+  /** V2：软删墓碑 */
+  deletedAt?: number | null;
   userId: number;
   title: string;
   category: string;
@@ -59,6 +69,8 @@ export type Task = {
 
 export type Log = {
   id: number;
+  /** V2：跨设备稳定主键（uuid），云端 settlement_logs.id */
+  uid?: string;
   userId: number;
   taskId: number;
   taskTitle: string;
@@ -77,10 +89,14 @@ export type Log = {
 
 export type ProficiencyRow = { id: number; userId: number; category: string; value: number };
 export type UnlockedAchievementRow = { id: number; userId: number; achievementId: string; unlockedAt: number };
-export type SkillNodeRow = { id: number; userId: number; nodeId: string; unlockedAt: number };
+export type SkillNodeRow = { id: number; userId: number; nodeId: string; unlockedAt: number; cost?: number };
 
 export type Reward = {
   id: number;
+  uid?: string;
+  updatedAt?: number;
+  deletedAt?: number | null;
+  archived?: number;
   userId: number;
   name: string;
   description: string;
@@ -93,6 +109,7 @@ export type Reward = {
 
 export type Redemption = {
   id: number;
+  uid?: string;
   userId: number;
   rewardId: number;
   name: string;

@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { useQuery } from "@tanstack/react-query";
 import type { Profile } from "@/lib/types";
 import { levelTitle } from "@shared/gameRules";
+import { OfflineBar, SyncIndicator } from "./sync-status";
 
 const NAV = [
   { href: "/", label: "今日面板", icon: LayoutDashboard },
@@ -119,8 +120,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* 桌面侧边栏 */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col justify-between border-r border-sidebar-border bg-sidebar px-3 py-4 lg:flex">
         <div className="flex flex-col gap-5">
-          <div className="px-1">
+          <div className="flex flex-col gap-2.5 px-1">
             <BrandMark />
+            <SyncIndicator className="self-start" />
           </div>
           <NavLinks />
         </div>
@@ -128,8 +130,12 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
 
       {/* 移动端顶栏 */}
-      <header className="sticky top-0 z-40 flex items-center justify-between gap-2 border-b border-border bg-background/95 px-4 py-2.5 backdrop-blur lg:hidden">
+      <header className="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur lg:hidden">
+        <OfflineBar />
+        <div className="flex items-center justify-between gap-2 px-4 py-2.5">
         <BrandMark />
+        <div className="flex min-w-0 shrink items-center gap-1.5">
+        <SyncIndicator />
         <Button
           size="icon"
           variant="ghost"
@@ -139,7 +145,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         >
           <Menu className="h-5 w-5" />
         </Button>
+        </div>
+        </div>
       </header>
+
+      <div className="hidden lg:block lg:pl-60">
+        <OfflineBar />
+      </div>
 
       {open && (
         <div className="fixed inset-0 z-50 lg:hidden">
