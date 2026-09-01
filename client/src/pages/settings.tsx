@@ -5,6 +5,7 @@ import { invalidateAll, useApp } from "@/lib/app-context";
 import { useToast } from "@/hooks/use-toast";
 import type { Profile } from "@/lib/types";
 import { Num, PageHeader } from "@/components/bits";
+import { UpkeepSettingsSection } from "@/components/upkeep-settings";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -227,6 +228,9 @@ export default function SettingsPage() {
             </p>
           )}
         </Section>
+
+        {/* 每日维持（V2） */}
+        <UpkeepSettingsSection />
 
         {/* AI */}
         <Section title="AI 建议服务" icon={Sparkles}>

@@ -239,6 +239,92 @@ export default function StatsPage() {
             </div>
           </Panel>
 
+          {/* 每日维持费用（V2） */}
+          <Panel
+            title="每日维持费"
+            hint={`最近 30 天 · 累计 −${stats.upkeepTotals?.charged ?? 0} 分`}
+          >
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={stats.upkeepDaily ?? []} margin={{ top: 6, right: 8, left: -4, bottom: 0 }}>
+                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "hsl(var(--muted-foreground))" }} interval={4} />
+                <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} width={40} />
+                <RTooltip content={<ChartTip unitMap={{ charged: "分维持费", bonus: "分奖励" }} />} />
+                <Bar dataKey="charged" radius={[4, 4, 0, 0]} animationDuration={700} data-testid="bar-upkeep-fee">
+                  {(stats.upkeepDaily ?? []).map((d) => (
+                    <Cell
+                      key={d.day}
+                      fill={d.estimated ? "hsl(var(--warn) / 0.45)" : d.charged > 0 ? "hsl(var(--warn))" : "hsl(var(--success))"}
+                    />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+            <p className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="h-2.5 w-2.5 rounded-[3px] bg-warn" />已结算的维持费
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="h-2.5 w-2.5 rounded-[3px] bg-warn/45" />今日预估（今晚结算）
+              </span>
+              <span>全维达成 {stats.upkeepTotals?.allMetDays ?? 0} 天 · 累计奖励回补 +{stats.upkeepTotals?.bonus ?? 0} 分 · 净支出 {(stats.upkeepTotals?.net ?? 0) >= 0 ? "−" : "+"}{Math.abs(stats.upkeepTotals?.net ?? 0)} 分</span>
+            </p>
+          </Panel>
+
+          {/* 达标度热力图（V2） */}
+          <Panel title="达标度热力图" hint="最近 30 天 × 5 类别">
+            <div className="overflow-x-auto scroll-thin pb-1">
+              <div className="w-max">
+                <div className="flex">
+                  <div className="w-16 shrink-0" />
+                  {(stats.upkeepHeatmap ?? []).map((d, i) => (
+                    <span
+                      key={d.day}
+                      className="num w-4 shrink-0 text-center text-[9px] text-muted-foreground"
+                    >
+                      {i % 5 === 0 ? d.label.split("/")[1] : ""}
+                    </span>
+                  ))}
+                </div>
+                {CATEGORIES.map((c) => (
+                  <div key={c.key} className="flex items-center">
+                    <span className="w-16 shrink-0 truncate pr-1.5 text-[10px] text-muted-foreground" title={c.name}>
+                      {c.name}
+                    </span>
+                    {(stats.upkeepHeatmap ?? []).map((d) => {
+                      const cell = d.cells.find((x) => x.category === c.key);
+                      const ratio = cell?.ratio ?? -1;
+                      const bg =
+                        ratio < 0
+                          ? "hsl(var(--muted) / 0.5)"
+                          : ratio >= 1
+                            ? "hsl(var(--success))"
+                            : `color-mix(in srgb, ${catColor(c.key)} ${Math.round(18 + 62 * ratio)}%, transparent)`;
+                      return (
+                        <span
+                          key={d.day + c.key}
+                          className={cn("m-[1px] h-3.5 w-3.5 shrink-0 rounded-[3px]", d.estimated && "ring-1 ring-warn/60")}
+                          style={{ background: bg }}
+                          title={`${d.day} · ${c.name} · ${ratio < 0 ? "无记录" : `达标度 ${Math.round(ratio * 100)}%`}${d.estimated ? "（今日预估）" : ""}`}
+                          data-testid={`upkeep-heat-${c.key}-${d.day}`}
+                        />
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="h-2.5 w-2.5 rounded-[3px] bg-success" />达标度 100%
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="h-2.5 w-2.5 rounded-[3px] bg-muted/50" />尚未结算
+              </span>
+              <span>颜色越深达标度越高 · 描边格为今日预估</span>
+            </p>
+          </Panel>
+
           {/* 日志 */}
           <Panel title="结算流水" hint="最近 200 条">
             {(logs ?? []).length === 0 ? (

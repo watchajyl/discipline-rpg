@@ -15,7 +15,11 @@ export type AchievementTrigger =
   | { type: "streak"; periods: number }
   | { type: "tasksInOneDay"; count: number }
   | { type: "balancedWeek" }
-  | { type: "level"; level: number };
+  | { type: "level"; level: number }
+  // ---- V2 每日维持机制新增触发器（追加，不影响既有 36 条） ----
+  | { type: "upkeepAllMetStreak"; days: number }
+  | { type: "upkeepZeroSpendStreak"; days: number }
+  | { type: "upkeepPerfectWeekNoExemption" };
 
 export type Achievement = {
   id: string;
@@ -23,7 +27,7 @@ export type Achievement = {
   desc: string;
   icon: string; // lucide icon name
   rarity: Rarity;
-  group: "proficiency" | "invest" | "persist" | "growth";
+  group: "proficiency" | "invest" | "persist" | "growth" | "upkeep";
   trigger: AchievementTrigger;
 };
 
@@ -125,18 +129,82 @@ const growthAchievements: Achievement[] = [
   trigger: { type: "level" as const, level: x.level },
 }));
 
+// 5. 每日维持类（V2 新增，追加在原 36 条之后）：6 条
+const upkeepAchievements: Achievement[] = [
+  {
+    id: "upkeep_allmet_3",
+    name: "日拱一卒",
+    desc: "连续 3 天全维达成",
+    icon: "Footprints",
+    rarity: "rare" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepAllMetStreak" as const, days: 3 },
+  },
+  {
+    id: "upkeep_allmet_7",
+    name: "七日圆满",
+    desc: "连续 7 天全维达成",
+    icon: "CircleCheckBig",
+    rarity: "epic" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepAllMetStreak" as const, days: 7 },
+  },
+  {
+    id: "upkeep_allmet_14",
+    name: "半月无缺",
+    desc: "连续 14 天全维达成",
+    icon: "MoonStar",
+    rarity: "epic" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepAllMetStreak" as const, days: 14 },
+  },
+  {
+    id: "upkeep_allmet_30",
+    name: "月度圆满",
+    desc: "连续 30 天全维达成",
+    icon: "Gem",
+    rarity: "legendary" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepAllMetStreak" as const, days: 30 },
+  },
+  {
+    id: "upkeep_zero_spend_week",
+    name: "零支出周",
+    desc: "连续 7 天维持费净支出为 0",
+    icon: "PiggyBank",
+    rarity: "rare" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepZeroSpendStreak" as const, days: 7 },
+  },
+  {
+    id: "upkeep_no_exemption_week",
+    name: "无需豁免",
+    desc: "某一整周未使用豁免格且全周全维达成",
+    icon: "ShieldCheck",
+    rarity: "epic" as Rarity,
+    group: "upkeep" as const,
+    trigger: { type: "upkeepPerfectWeekNoExemption" as const },
+  },
+];
+
 export const ACHIEVEMENTS: Achievement[] = [
   ...proficiencyAchievements,
   ...investAchievements,
   ...persistAchievements,
   ...growthAchievements,
+  ...upkeepAchievements,
 ];
+
+/** V1 原始 36 条的数量，回归验证用 */
+export const V1_ACHIEVEMENT_COUNT =
+  proficiencyAchievements.length + investAchievements.length + persistAchievements.length + growthAchievements.length;
 
 export const ACHIEVEMENT_GROUPS: { key: Achievement["group"]; name: string }[] = [
   { key: "proficiency", name: "熟练度" },
   { key: "invest", name: "累计投入" },
   { key: "persist", name: "坚持" },
   { key: "growth", name: "成长" },
+  { key: "upkeep", name: "每日维持" },
 ];
 
 export type AchievementSnapshot = {
@@ -146,6 +214,10 @@ export type AchievementSnapshot = {
   maxStreak: number;
   maxTasksInOneDay: number;
   balancedWeek: boolean;
+  // ---- V2 每日维持机制（可选，缺省视为 0/false，不影响既有成就判定） ----
+  upkeepBestAllMetStreak?: number;
+  upkeepBestZeroSpendStreak?: number;
+  upkeepPerfectWeekNoExemption?: boolean;
 };
 
 /** 返回成就的当前进度 {current, target}（target 为 1 时表示布尔型） */
@@ -167,6 +239,20 @@ export function achievementProgress(a: Achievement, s: AchievementSnapshot): { c
       return { current: s.balancedWeek ? 1 : 0, target: 1, label: s.balancedWeek ? "已达成" : "本周尚未覆盖五类" };
     case "level":
       return { current: Math.min(s.level, a.trigger.level), target: a.trigger.level, label: `Lv.${Math.min(s.level, a.trigger.level)} / Lv.${a.trigger.level}` };
+    case "upkeepAllMetStreak": {
+      const cur = Math.min(s.upkeepBestAllMetStreak ?? 0, a.trigger.days);
+      return { current: cur, target: a.trigger.days, label: `${cur} / ${a.trigger.days} 天全维达成` };
+    }
+    case "upkeepZeroSpendStreak": {
+      const cur = Math.min(s.upkeepBestZeroSpendStreak ?? 0, a.trigger.days);
+      return { current: cur, target: a.trigger.days, label: `${cur} / ${a.trigger.days} 天净支出为 0` };
+    }
+    case "upkeepPerfectWeekNoExemption":
+      return {
+        current: s.upkeepPerfectWeekNoExemption ? 1 : 0,
+        target: 1,
+        label: s.upkeepPerfectWeekNoExemption ? "已达成" : "尚未有全周无豁免的满勤周",
+      };
   }
 }
 
@@ -180,5 +266,6 @@ export function achievementById(id: string): Achievement | undefined {
 }
 
 export function achievementCategoryLabel(a: Achievement): string {
-  return a.trigger.type === "proficiency" ? categoryName(a.trigger.category) : "全局";
+  if (a.trigger.type === "proficiency") return categoryName(a.trigger.category);
+  return a.group === "upkeep" ? "每日维持" : "全局";
 }

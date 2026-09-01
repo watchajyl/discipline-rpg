@@ -81,6 +81,12 @@ const routes: Route[] = [
   { method: "GET", pattern: /^\/api\/logs\/(\d+)$/, handler: () => db.getLogs() },
   { method: "GET", pattern: /^\/api\/stats\/(\d+)$/, handler: () => db.getStats() },
 
+  // ---------------- 每日维持（V2） ----------------
+  { method: "GET", pattern: /^\/api\/upkeep\/(\d+)$/, handler: () => db.getUpkeep() },
+  { method: "POST", pattern: /^\/api\/upkeep\/catchup$/, handler: () => db.catchUpUpkeep() },
+  { method: "POST", pattern: /^\/api\/upkeep\/exempt$/, handler: ({ body }) => db.useUpkeepExemption(body) },
+  { method: "PATCH", pattern: /^\/api\/upkeep\/config$/, handler: ({ body }) => db.updateUpkeepConfig(body) },
+
   // ---------------- 技能树 ----------------
   {
     method: "POST",

@@ -29,6 +29,7 @@ import {
   SKILL_NODES,
   categoryName,
   computeSettlement,
+  RULE_DEFAULTS,
   dateKey,
   effectsFor,
   FINISH_BONUS_RATE,
@@ -42,7 +43,33 @@ import {
   ruleSuggest,
   weekKey,
 } from "@shared/gameRules";
-import { ACHIEVEMENTS, isAchieved, RARITY_META, type AchievementSnapshot } from "@shared/achievements";
+import { ACHIEVEMENTS, isAchieved, RARITY_META, V1_ACHIEVEMENT_COUNT, type AchievementSnapshot } from "@shared/achievements";
+import {
+  addDays,
+  applyDailyCap,
+  attainment,
+  categoryFee,
+  dayDiff,
+  isDailyBilled,
+  isWeekEnd,
+  normalizeUpkeepConfig,
+  setUpkeepClockOffsetMs,
+  UPKEEP_ALL_MET_STREAK_BONUSES,
+  UPKEEP_BACKFILL_MAX_DAYS,
+  UPKEEP_DEFAULT_CONFIG,
+  UPKEEP_SUMMARY_MIN_DAYS,
+  UPKEEP_ZERO_SPEND_DAYS,
+  upkeepNowMs,
+  upkeepToday,
+  weekDays,
+  weekStart,
+  type UpkeepCategoryDay,
+  type UpkeepConfig,
+  type UpkeepConfigRow,
+  type UpkeepDay,
+  type UpkeepExemption,
+  type UpkeepTargets,
+} from "@shared/upkeep";
 import {
   decryptSecretValue,
   encryptSecretValue,
@@ -72,6 +99,10 @@ type DbDoc = {
   rememberedToken: string | null;
   /** 每个账号最近一次导出备份的时间 */
   lastBackupAt: Record<string, number>;
+  // ---- V2 每日维持机制（只追加 + updated_at + 软删，便于后续云端同步） ----
+  upkeepDays: UpkeepDay[];
+  upkeepExemptions: UpkeepExemption[];
+  upkeepConfigs: UpkeepConfigRow[];
 };
 
 function emptyDoc(): DbDoc {
@@ -91,6 +122,9 @@ function emptyDoc(): DbDoc {
     timers: [],
     rememberedToken: null,
     lastBackupAt: {},
+    upkeepDays: [],
+    upkeepExemptions: [],
+    upkeepConfigs: [],
   };
 }
 
@@ -119,6 +153,9 @@ export async function ensureLoaded(): Promise<void> {
         doc = { ...emptyDoc(), ...parsed };
         if (!doc.appSecret) doc.appSecret = randomHex(32);
         if (!doc.lastBackupAt) doc.lastBackupAt = {};
+        if (!Array.isArray(doc.upkeepDays)) doc.upkeepDays = [];
+        if (!Array.isArray(doc.upkeepExemptions)) doc.upkeepExemptions = [];
+        if (!Array.isArray(doc.upkeepConfigs)) doc.upkeepConfigs = [];
       } catch {
         doc = emptyDoc();
       }
@@ -422,6 +459,7 @@ function buildSnapshot(userId: number): AchievementSnapshot {
     if (CATEGORY_KEYS.every((c) => s.has(c))) balancedWeek = true;
   });
   const maxStreak = taskList.reduce((a, t) => Math.max(a, t.bestStreak), 0);
+  const upkeep = upkeepSnapshot(userId);
   return {
     level: levelFromXp(user.xp),
     proficiency: getProficiency(userId),
@@ -429,6 +467,9 @@ function buildSnapshot(userId: number): AchievementSnapshot {
     maxStreak,
     maxTasksInOneDay,
     balancedWeek,
+    upkeepBestAllMetStreak: upkeep.bestAllMetStreak,
+    upkeepBestZeroSpendStreak: upkeep.bestZeroSpendStreak,
+    upkeepPerfectWeekNoExemption: upkeep.perfectWeekNoExemption,
   };
 }
 
@@ -631,6 +672,8 @@ function clearUserData(userId: number) {
   doc.achievements = doc.achievements.filter((a) => a.userId !== userId);
   doc.skillNodes = doc.skillNodes.filter((n) => n.userId !== userId);
   doc.redemptions = doc.redemptions.filter((r) => r.userId !== userId);
+  doc.upkeepDays = doc.upkeepDays.filter((r) => r.userId !== userId);
+  doc.upkeepExemptions = doc.upkeepExemptions.filter((r) => r.userId !== userId);
   const u = getUser(userId);
   if (u) {
     u.xp = 0;
@@ -1125,11 +1168,92 @@ export async function getStats() {
     const rows = all.filter((l) => l.day === key);
     heatmap.push({ day: key, xp: rows.reduce((a, r) => a + r.xp, 0), count: rows.filter((r) => r.xp > 0).length });
   }
+  // ---- V2 每日维持：近 30 天费用柱状图 + 30 天 × 5 类别达标度热力图 ----
+  const upkeepCfg = getUpkeepConfig(userId);
+  const upkeepRows = new Map(listUpkeepDays(userId).map((r) => [r.day, r]));
+  const todayKey = upkeepToday();
+  const upkeepDaily: {
+    day: string;
+    label: string;
+    charged: number;
+    bonus: number;
+    net: number;
+    allMet: boolean;
+    estimated: boolean;
+  }[] = [];
+  const upkeepHeatmap: { day: string; label: string; estimated: boolean; cells: { category: string; ratio: number; billable: boolean }[] }[] = [];
+  for (let i = 29; i >= 0; i--) {
+    const key = addDays(todayKey, -i);
+    const d = new Date(key + "T12:00:00");
+    const label = `${d.getMonth() + 1}/${d.getDate()}`;
+    const row = upkeepRows.get(key);
+    const estimated = !row && key === todayKey;
+    if (row) {
+      upkeepDaily.push({
+        day: key,
+        label,
+        charged: row.totalCharged,
+        bonus: row.bonusGranted + row.streakBonus,
+        net: row.netSpend,
+        allMet: row.allMet,
+        estimated: false,
+      });
+      upkeepHeatmap.push({
+        day: key,
+        label,
+        estimated: false,
+        cells: CATEGORY_KEYS.map((c) => ({
+          category: c,
+          ratio: row.perCategory[c]?.ratio ?? 0,
+          billable: row.perCategory[c]?.billable ?? false,
+        })),
+      });
+    } else if (estimated) {
+      const preview = previewUpkeepDay(userId, key, upkeepCfg);
+      upkeepDaily.push({
+        day: key,
+        label,
+        charged: preview.totalDue,
+        bonus: preview.allMet ? upkeepCfg.allMetBonus : 0,
+        net: preview.netSpend,
+        allMet: preview.allMet,
+        estimated: true,
+      });
+      upkeepHeatmap.push({
+        day: key,
+        label,
+        estimated: true,
+        cells: CATEGORY_KEYS.map((c) => ({
+          category: c,
+          ratio: preview.perCategory[c]?.ratio ?? 0,
+          billable: preview.perCategory[c]?.billable ?? false,
+        })),
+      });
+    } else {
+      upkeepDaily.push({ day: key, label, charged: 0, bonus: 0, net: 0, allMet: false, estimated: false });
+      upkeepHeatmap.push({
+        day: key,
+        label,
+        estimated: false,
+        cells: CATEGORY_KEYS.map((c) => ({ category: c, ratio: -1, billable: false })),
+      });
+    }
+  }
+
   return {
     daily,
     weekly,
     byCategory,
     heatmap,
+    upkeepDaily,
+    upkeepHeatmap,
+    upkeepTotals: {
+      charged: upkeepDaily.reduce((a, r) => a + (r.estimated ? 0 : r.charged), 0),
+      bonus: upkeepDaily.reduce((a, r) => a + (r.estimated ? 0 : r.bonus), 0),
+      net: upkeepDaily.reduce((a, r) => a + (r.estimated ? 0 : r.net), 0),
+      allMetDays: upkeepDaily.filter((r) => !r.estimated && r.allMet).length,
+      settledDays: upkeepDaily.filter((r) => upkeepRows.has(r.day)).length,
+    },
     totals: {
       xp: all.reduce((a, r) => a + r.xp, 0),
       points: all.reduce((a, r) => a + r.points, 0),
@@ -1271,6 +1395,9 @@ export async function exportData() {
     skillNodes: unlockedNodes(userId),
     rewards: doc.rewards.filter((r) => r.userId === userId),
     redemptions: doc.redemptions.filter((r) => r.userId === userId),
+    upkeepDays: doc.upkeepDays.filter((r) => r.userId === userId),
+    upkeepExemptions: doc.upkeepExemptions.filter((r) => r.userId === userId),
+    upkeepConfig: getUpkeepConfig(userId),
   };
   doc.lastBackupAt[String(userId)] = Date.now();
   await persist();
@@ -1329,6 +1456,21 @@ export async function importData(payload: any) {
       createdAt: r.createdAt ?? Date.now(),
     });
   }
+  for (const r of payload.upkeepDays ?? []) {
+    if (!r?.day) continue;
+    doc.upkeepDays.push({ ...(r as UpkeepDay), userId, deletedAt: r.deletedAt ?? null, updatedAt: r.updatedAt ?? Date.now() });
+  }
+  for (const r of payload.upkeepExemptions ?? []) {
+    if (!r?.day || !r?.category) continue;
+    doc.upkeepExemptions.push({
+      ...(r as UpkeepExemption),
+      id: nextId("upkeepExemptions"),
+      userId,
+      deletedAt: r.deletedAt ?? null,
+      updatedAt: r.updatedAt ?? Date.now(),
+    });
+  }
+  if (payload.upkeepConfig) writeUpkeepConfig(userId, normalizeUpkeepConfig(payload.upkeepConfig));
   const user = getUser(userId)!;
   user.xp = Number(payload.user?.xp) || 0;
   user.points = Number(payload.user?.points) || 0;
@@ -1704,4 +1846,582 @@ export async function createDemoAccount() {
   const token = await createSession(user.id, true);
   const seeded = await seedDemoData();
   return { user: await publicUser(user.id), token, username, password: "grow2026", seeded };
+}
+
+// ============================================================
+// V2 每日维持机制引擎
+// 所有可调参数在 @shared/upkeep 中；此处只做取数、结算与持久化。
+// 设计要点：
+//   1) upkeepDays 只追加，主键 (userId, day)，重复结算直接跳过 → 幂等
+//   2) 每行带 updatedAt / deletedAt，便于后续云端同步与软删
+//   3) 不向 doc.logs 写任何维持记录，V1 的统计与成就数值完全不受影响
+// ============================================================
+
+// ---------------- 配置 ----------------
+export function getUpkeepConfig(userId: number): UpkeepConfig {
+  const row = doc.upkeepConfigs.find((r) => r.userId === userId);
+  return normalizeUpkeepConfig(row?.config ?? UPKEEP_DEFAULT_CONFIG);
+}
+
+function writeUpkeepConfig(userId: number, cfg: UpkeepConfig) {
+  const row = doc.upkeepConfigs.find((r) => r.userId === userId);
+  if (row) {
+    row.config = cfg;
+    row.updatedAt = Date.now();
+  } else {
+    doc.upkeepConfigs.push({ userId, config: cfg, updatedAt: Date.now() });
+  }
+}
+
+// ---------------- 取数 ----------------
+function listUpkeepDays(userId: number): UpkeepDay[] {
+  return doc.upkeepDays.filter((r) => r.userId === userId && !r.deletedAt).sort((a, b) => (a.day < b.day ? -1 : 1));
+}
+
+function findUpkeepDay(userId: number, day: string): UpkeepDay | undefined {
+  return doc.upkeepDays.find((r) => r.userId === userId && r.day === day && !r.deletedAt);
+}
+
+/** 某日某类别的实际投入（结算次数只数产出为正的结算，与 V1 统计口径一致） */
+function upkeepDayMetrics(userId: number, day: string, category: string) {
+  const rows = doc.logs.filter((l) => l.userId === userId && l.day === day && l.category === category);
+  return {
+    minutes: rows.reduce((a, r) => a + Math.max(0, r.minutes), 0),
+    proficiency: rows.reduce((a, r) => a + Math.max(0, r.prof), 0),
+    count: rows.filter((r) => r.xp > 0).length,
+  };
+}
+
+/** 该日所属自然周内、截至该日的累计投入（weekly 模式用） */
+function upkeepWeekMetrics(userId: number, day: string, category: string) {
+  const days = weekDays(day).filter((d) => d <= day);
+  return days.reduce(
+    (acc, d) => {
+      const m = upkeepDayMetrics(userId, d, category);
+      return { minutes: acc.minutes + m.minutes, proficiency: acc.proficiency + m.proficiency, count: acc.count + m.count };
+    },
+    { minutes: 0, proficiency: 0, count: 0 },
+  );
+}
+
+function exemptedCategories(userId: number, day: string): Set<string> {
+  return new Set(
+    doc.upkeepExemptions.filter((e) => e.userId === userId && e.day === day && !e.deletedAt).map((e) => e.category),
+  );
+}
+
+function exemptionsUsedInWeek(userId: number, day: string): number {
+  const start = weekStart(day);
+  const end = addDays(start, 6);
+  return doc.upkeepExemptions.filter((e) => e.userId === userId && !e.deletedAt && e.day >= start && e.day <= end).length;
+}
+
+function userCreatedDay(userId: number): string {
+  const u = getUser(userId)!;
+  return dateKey(new Date(u.createdAt));
+}
+
+/** 新账号宽限期：期间只展示不扣费 */
+function graceInfo(userId: number, cfg: UpkeepConfig, day: string) {
+  const created = userCreatedDay(userId);
+  const elapsed = Math.max(0, dayDiff(created, day));
+  const inGrace = elapsed < cfg.graceDays;
+  return { inGrace, daysLeft: Math.max(0, cfg.graceDays - elapsed), created };
+}
+
+/** 上一日结转的连续未达标天数（豁免日原样结转，不递增也不清零） */
+function prevMissStreak(userId: number, day: string, category: string): number {
+  const prev = findUpkeepDay(userId, addDays(day, -1));
+  return prev?.perCategory?.[category]?.missStreak ?? 0;
+}
+
+/** weekly 模式：上一个结算周结转的连续未达标周数 */
+function prevWeeklyMissStreak(userId: number, day: string, category: string): number {
+  for (let i = 1; i <= 14; i++) {
+    const row = findUpkeepDay(userId, addDays(day, -i));
+    const pc = row?.perCategory?.[category];
+    if (pc?.weeklySettled) return pc.missStreak;
+  }
+  return 0;
+}
+
+function prevAllMetStreak(userId: number, day: string): number {
+  const prev = findUpkeepDay(userId, addDays(day, -1));
+  return prev?.allMetStreak ?? 0;
+}
+
+// ---------------- 单日计算（纯读，不写库） ----------------
+type UpkeepDayComputation = {
+  day: string;
+  perCategory: Record<string, UpkeepCategoryDay>;
+  totalDue: number;
+  totalCharged: number;
+  totalWaived: number;
+  bonusGranted: number;
+  streakBonus: number;
+  netSpend: number;
+  exemptionsUsed: number;
+  allMet: boolean;
+  allMetStreak: number;
+  grace: boolean;
+  graceDaysLeft: number;
+  capped: boolean;
+  rawTotal: number;
+  streakMilestone: number | null;
+};
+
+function computeUpkeepDay(userId: number, day: string, cfg: UpkeepConfig): UpkeepDayComputation {
+  const grace = graceInfo(userId, cfg, day);
+  const exempted = exemptedCategories(userId, day);
+  const isSettleDayForWeek = isWeekEnd(day);
+  const fees: Record<string, number> = {};
+  const perCategory: Record<string, UpkeepCategoryDay> = {};
+
+  for (const category of CATEGORY_KEYS) {
+    const c = cfg.categories[category as keyof typeof cfg.categories];
+    const dailyMetrics = upkeepDayMetrics(userId, day, category);
+    let targets: UpkeepTargets = c.targets;
+    let metrics = dailyMetrics;
+    let billable = isDailyBilled(c.mode);
+    let weeklySettled = false;
+
+    if (c.mode === "weekly") {
+      metrics = upkeepWeekMetrics(userId, day, category);
+      targets = c.weeklyTargets;
+      weeklySettled = isSettleDayForWeek;
+      billable = false; // 不计入「全维达成」的每日判定，只在周日结算维持费
+    }
+
+    const att = attainment(targets, metrics);
+    const isExempt = exempted.has(category) && (billable || c.mode === "weekly");
+    let missStreak = 0;
+    let fee = 0;
+
+    if (c.mode === "off") {
+      missStreak = 0;
+    } else if (c.mode === "weekly") {
+      const prev = prevWeeklyMissStreak(userId, day, category);
+      if (isExempt) {
+        missStreak = prev;
+      } else if (att.ratio >= 1) {
+        missStreak = weeklySettled ? 0 : prev;
+      } else {
+        missStreak = weeklySettled ? prev + 1 : prev;
+      }
+      if (weeklySettled && !isExempt && att.ratio < 1) {
+        fee = categoryFee(c.baseFee, att.ratio, cfg.escalation, missStreak);
+      }
+    } else {
+      const prev = prevMissStreak(userId, day, category);
+      if (isExempt) {
+        // 豁免：当日免费，且不计入连续未达标天数
+        missStreak = prev;
+      } else if (att.ratio >= 1) {
+        missStreak = 0;
+      } else {
+        // 宽限期内只展示不扣费，也不累积连续未达标天数（出宽限期后从最轻的倍数开始）
+        missStreak = grace.inGrace ? prev : prev + 1;
+        fee = categoryFee(c.baseFee, att.ratio, cfg.escalation, prev + 1);
+      }
+    }
+
+    fees[category] = fee;
+    perCategory[category] = {
+      category: category as any,
+      mode: c.mode,
+      billable,
+      ratio: att.ratio,
+      parts: att.parts,
+      fee,
+      due: fee,
+      charged: 0,
+      waived: 0,
+      exempted: isExempt,
+      missStreak,
+      weeklySettled,
+    };
+  }
+
+  const rawTotal = Object.values(fees).reduce((a, b) => a + b, 0);
+  const { total: cappedTotal, scaled } = applyDailyCap(fees, cfg.dailyCapPoints);
+  for (const category of CATEGORY_KEYS) perCategory[category].due = scaled[category] ?? 0;
+
+  // 全维达成：所有按日计费类别达标度均为 1（豁免不算达成）
+  const billableKeys = CATEGORY_KEYS.filter((c) => perCategory[c].billable);
+  const allMet =
+    billableKeys.length > 0 && billableKeys.every((c) => perCategory[c].ratio >= 1 && !perCategory[c].exempted);
+  const allMetStreak = allMet ? prevAllMetStreak(userId, day) + 1 : 0;
+  const milestone = allMet ? UPKEEP_ALL_MET_STREAK_BONUSES.find((b) => b.days === allMetStreak) : undefined;
+  const bonusGranted = allMet ? cfg.allMetBonus : 0;
+  const streakBonus = milestone?.bonus ?? 0;
+
+  const due = grace.inGrace ? 0 : cappedTotal;
+  const balance = getUser(userId)!.points;
+  const charged = Math.max(0, Math.min(due, balance));
+  const waived = due - charged;
+
+  // 实扣按应扣比例分摊，便于面板逐类别展示
+  if (charged > 0 && cappedTotal > 0) {
+    const ordered = CATEGORY_KEYS.slice().sort((a, b) => perCategory[b].due - perCategory[a].due);
+    let used = 0;
+    for (const c of ordered) {
+      const v = Math.min(perCategory[c].due, Math.floor((perCategory[c].due / cappedTotal) * charged));
+      perCategory[c].charged = v;
+      used += v;
+    }
+    let rest = Math.max(0, charged - used);
+    while (rest > 0) {
+      let moved = false;
+      for (const c of ordered) {
+        if (rest <= 0) break;
+        if (perCategory[c].charged < perCategory[c].due) {
+          perCategory[c].charged += 1;
+          rest -= 1;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    for (const c of CATEGORY_KEYS) {
+      perCategory[c].waived = Math.max(0, perCategory[c].due - perCategory[c].charged);
+    }
+  } else {
+    for (const c of CATEGORY_KEYS) {
+      perCategory[c].charged = 0;
+      perCategory[c].waived = grace.inGrace ? 0 : perCategory[c].due;
+    }
+  }
+
+  return {
+    day,
+    perCategory,
+    totalDue: due,
+    totalCharged: charged,
+    totalWaived: waived,
+    bonusGranted,
+    streakBonus,
+    netSpend: charged - bonusGranted - streakBonus,
+    exemptionsUsed: CATEGORY_KEYS.filter((c) => perCategory[c].exempted).length,
+    allMet,
+    allMetStreak,
+    grace: grace.inGrace,
+    graceDaysLeft: grace.daysLeft,
+    capped: rawTotal > cfg.dailyCapPoints,
+    rawTotal,
+    streakMilestone: milestone?.days ?? null,
+  };
+}
+
+/** 当天的实时预估（不写库、不扣费） */
+function previewUpkeepDay(userId: number, day: string, cfg: UpkeepConfig): UpkeepDayComputation {
+  return computeUpkeepDay(userId, day, cfg);
+}
+
+// ---------------- 结算落库（幂等） ----------------
+function settleUpkeepDay(userId: number, day: string, cfg: UpkeepConfig): UpkeepDay | null {
+  if (findUpkeepDay(userId, day)) return null; // (userId, day) 主键去重 → 幂等
+  const comp = computeUpkeepDay(userId, day, cfg);
+  const now = Date.now();
+  const user = getUser(userId)!;
+  user.points = Math.max(0, user.points - comp.totalCharged);
+  user.points += comp.bonusGranted + comp.streakBonus;
+  const row: UpkeepDay = {
+    userId,
+    day,
+    perCategory: comp.perCategory,
+    totalDue: comp.totalDue,
+    totalCharged: comp.totalCharged,
+    totalWaived: comp.totalWaived,
+    bonusGranted: comp.bonusGranted,
+    streakBonus: comp.streakBonus,
+    netSpend: comp.netSpend,
+    exemptionsUsed: comp.exemptionsUsed,
+    allMet: comp.allMet,
+    allMetStreak: comp.allMetStreak,
+    grace: comp.grace,
+    capped: comp.capped,
+    settledAt: now,
+    updatedAt: now,
+    deletedAt: null,
+  };
+  doc.upkeepDays.push(row);
+  return row;
+}
+
+// ---------------- 成就快照 ----------------
+function upkeepSnapshot(userId: number) {
+  const rows = listUpkeepDays(userId);
+  let bestAllMetStreak = 0;
+  for (const r of rows) bestAllMetStreak = Math.max(bestAllMetStreak, r.allMetStreak);
+
+  let bestZeroSpendStreak = 0;
+  let run = 0;
+  let prevDay = "";
+  for (const r of rows) {
+    if (r.grace) {
+      // 宽限期不计入「零支出周」，避免新账号一开就白拿成就
+      run = 0;
+      prevDay = r.day;
+      continue;
+    }
+    const contiguous = prevDay ? dayDiff(prevDay, r.day) === 1 : true;
+    run = (contiguous ? run : 0) + (r.netSpend <= 0 ? 1 : 0);
+    if (r.netSpend > 0) run = 0;
+    bestZeroSpendStreak = Math.max(bestZeroSpendStreak, run);
+    prevDay = r.day;
+  }
+
+  // 无需豁免：某一整周 7 天全部有结算记录、全部全维达成、且全周未用豁免
+  let perfectWeekNoExemption = false;
+  const byDay = new Map(rows.map((r) => [r.day, r]));
+  const weekStarts = Array.from(new Set(rows.map((r) => weekStart(r.day))));
+  for (const ws of weekStarts) {
+    const days = weekDays(ws);
+    const all = days.map((d) => byDay.get(d));
+    if (all.every((r) => r && r.allMet && r.exemptionsUsed === 0)) {
+      const used = exemptionsUsedInWeek(userId, ws);
+      if (used === 0) perfectWeekNoExemption = true;
+    }
+  }
+
+  return { bestAllMetStreak, bestZeroSpendStreak, perfectWeekNoExemption, zeroSpendTarget: UPKEEP_ZERO_SPEND_DAYS };
+}
+
+// ---------------- 面板数据 ----------------
+function upkeepView(userId: number, catchUp?: { days: number; charged: number; rows: { day: string; charged: number; net: number; allMet: boolean }[] } | null) {
+  const cfg = getUpkeepConfig(userId);
+  const today = upkeepToday();
+  const preview = computeUpkeepDay(userId, today, cfg);
+  const rows = listUpkeepDays(userId);
+  const recent = rows.slice(-30);
+  const usedThisWeek = exemptionsUsedInWeek(userId, today);
+  const snap = upkeepSnapshot(userId);
+  const lastSettledDay = rows.length ? rows[rows.length - 1].day : null;
+  return {
+    config: cfg,
+    today,
+    weekStart: weekStart(today),
+    estimate: {
+      day: today,
+      perCategory: preview.perCategory,
+      totalDue: preview.totalDue,
+      rawTotal: preview.rawTotal,
+      capped: preview.capped,
+      allMet: preview.allMet,
+      allMetStreak: preview.allMetStreak,
+      bonus: preview.bonusGranted,
+      streakBonus: preview.streakBonus,
+      netSpend: preview.netSpend,
+      grace: preview.grace,
+      graceDaysLeft: preview.graceDaysLeft,
+      streakMilestone: preview.streakMilestone,
+    },
+    exemptions: {
+      total: cfg.weeklyExemptions,
+      used: usedThisWeek,
+      left: Math.max(0, cfg.weeklyExemptions - usedThisWeek),
+      today: Array.from(exemptedCategories(userId, today)),
+    },
+    lastSettledDay,
+    recent,
+    catchUp: catchUp ?? null,
+    snapshot: snap,
+    nextMilestone: UPKEEP_ALL_MET_STREAK_BONUSES.find((b) => b.days > preview.allMetStreak) ?? null,
+    streakBonuses: UPKEEP_ALL_MET_STREAK_BONUSES,
+    summaryMinDays: UPKEEP_SUMMARY_MIN_DAYS,
+  };
+}
+
+// ---------------- 对外 API ----------------
+/** 跨日结算：从上次结算日的次日逐日补算到「昨天」，幂等 */
+export async function catchUpUpkeep() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const cfg = getUpkeepConfig(userId);
+  const today = upkeepToday();
+  const yesterday = addDays(today, -1);
+  const settled: { day: string; charged: number; net: number; allMet: boolean }[] = [];
+
+  if (cfg.enabled) {
+    const rows = listUpkeepDays(userId);
+    const created = userCreatedDay(userId);
+    let cursor = rows.length ? addDays(rows[rows.length - 1].day, 1) : created;
+    const earliest = addDays(yesterday, -(UPKEEP_BACKFILL_MAX_DAYS - 1));
+    if (cursor < earliest) cursor = earliest;
+    let guard = 0;
+    while (cursor <= yesterday && guard++ < UPKEEP_BACKFILL_MAX_DAYS + 2) {
+      const row = settleUpkeepDay(userId, cursor, cfg);
+      if (row) settled.push({ day: row.day, charged: row.totalCharged, net: row.netSpend, allMet: row.allMet });
+      cursor = addDays(cursor, 1);
+    }
+  }
+
+  const newAchievements = settled.length ? checkAchievements(userId) : [];
+  if (settled.length) await persist();
+  const summary = {
+    days: settled.length,
+    charged: settled.reduce((a, r) => a + r.charged, 0),
+    net: settled.reduce((a, r) => a + r.net, 0),
+    allMetDays: settled.filter((r) => r.allMet).length,
+    rows: settled,
+  };
+  return { ...upkeepView(userId, summary.days ? summary : null), newAchievements, summary };
+}
+
+export async function getUpkeep() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return upkeepView(userId, null);
+}
+
+/** 使用本周豁免格：该类别当日免费且不计入连续未达标天数，不可透支 */
+export async function useUpkeepExemption(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const category = String(body?.category ?? "");
+  if (!CATEGORY_KEYS.includes(category as any)) throw new LocalError("类别不存在");
+  const cfg = getUpkeepConfig(userId);
+  if (!cfg.enabled) throw new LocalError("维持机制当前已关闭");
+  const mode = cfg.categories[category as keyof typeof cfg.categories].mode;
+  if (mode === "off") throw new LocalError("该类别当前为「只统计」，无需豁免");
+  const today = upkeepToday();
+  if (exemptedCategories(userId, today).has(category)) throw new LocalError("该类别今日已使用豁免");
+  const used = exemptionsUsedInWeek(userId, today);
+  if (used >= cfg.weeklyExemptions) throw new LocalError("本周豁免格已用完，下周一恢复");
+  const now = Date.now();
+  doc.upkeepExemptions.push({
+    id: nextId("upkeepExemptions"),
+    userId,
+    day: today,
+    category,
+    createdAt: now,
+    updatedAt: now,
+    deletedAt: null,
+  });
+  await persist();
+  return upkeepView(userId, null);
+}
+
+export async function updateUpkeepConfig(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const reset = !!body?.reset;
+  const base = reset ? UPKEEP_DEFAULT_CONFIG : { ...getUpkeepConfig(userId), ...(body?.config ?? body ?? {}) };
+  const next = normalizeUpkeepConfig(base);
+  writeUpkeepConfig(userId, next);
+  await persist();
+  return upkeepView(userId, null);
+}
+
+// ============================================================
+// 仅供自动化自测使用的时间/数据注入点。
+// 生产 UI 中没有任何入口，只在 window 上挂载函数，不影响任何界面与数值。
+// ============================================================
+export const __upkeepDev = {
+  async setClockOffsetDays(days: number) {
+    setUpkeepClockOffsetMs(Math.round(Number(days) || 0) * 86400000);
+    return { offsetDays: Number(days) || 0 };
+  },
+  async resetClock() {
+    setUpkeepClockOffsetMs(0);
+    return { offsetDays: 0 };
+  },
+  /** 直接写入一条产出日志（不加分、不动等级），用于构造历史投入 */
+  async injectLog(input: { category: string; day: string; minutes?: number; prof?: number; settlements?: number }) {
+    await ensureLoaded();
+    const userId = requireUserId();
+    const n = Math.max(1, Math.round(Number(input.settlements ?? 1)));
+    for (let i = 0; i < n; i++) {
+      doc.logs.push({
+        id: nextId("logs"),
+        userId,
+        taskId: 0,
+        taskTitle: "自测注入",
+        category: input.category,
+        mode: "timer",
+        kind: "block",
+        day: input.day,
+        xp: 1,
+        points: 0,
+        prof: i === 0 ? Math.max(0, Math.round(Number(input.prof ?? 0))) : 0,
+        minutes: i === 0 ? Math.max(0, Math.round(Number(input.minutes ?? 0))) : 0,
+        ratio: 1,
+        note: "dev",
+        createdAt: Date.now(),
+      });
+    }
+    await persist();
+    return { ok: true };
+  },
+  async setPoints(points: number) {
+    await ensureLoaded();
+    const userId = requireUserId();
+    getUser(userId)!.points = Math.max(0, Math.round(Number(points) || 0));
+    await persist();
+    return { points: getUser(userId)!.points };
+  },
+  async setCreatedDaysAgo(days: number) {
+    await ensureLoaded();
+    const userId = requireUserId();
+    getUser(userId)!.createdAt = Date.now() - Math.max(0, Math.round(Number(days) || 0)) * 86400000;
+    await persist();
+    return { createdAt: getUser(userId)!.createdAt };
+  },
+  async resetUpkeep() {
+    await ensureLoaded();
+    const userId = requireUserId();
+    doc.upkeepDays = doc.upkeepDays.filter((r) => r.userId !== userId);
+    doc.upkeepExemptions = doc.upkeepExemptions.filter((r) => r.userId !== userId);
+    doc.logs = doc.logs.filter((l) => !(l.userId === userId && l.note === "dev"));
+    doc.achievements = doc.achievements.filter(
+      (a) => !(a.userId === userId && a.achievementId.startsWith("upkeep_")),
+    );
+    setUpkeepClockOffsetMs(0);
+    await persist();
+    return { ok: true };
+  },
+  /** V1 回归自测：纯计算，不写库 */
+  v1Baseline() {
+    const out: Record<string, number[]> = {};
+    const run = (key: string, mode: any, ratio: number) => {
+      const d = (RULE_DEFAULTS as any)[key];
+      const r = computeSettlement({
+        xpPerUnit: d.xpPerUnit,
+        pointsPerUnit: d.pointsPerUnit,
+        profPerUnit: d.profPerUnit,
+        difficulty: 2,
+        ratio,
+        mode,
+        streak: 0,
+      });
+      out[key] = [r.xp, r.points, r.prof];
+    };
+    run("academic_timer", "timer", 1);
+    run("academic_milestone", "milestone", 1);
+    run("academic_habit", "habit", 1);
+    run("academic_count", "count", 1);
+    return { results: out, v1AchievementCount: V1_ACHIEVEMENT_COUNT, totalAchievements: ACHIEVEMENTS.length };
+  },
+  async catchUp() {
+    return catchUpUpkeep();
+  },
+  async view() {
+    return getUpkeep();
+  },
+  async dump() {
+    await ensureLoaded();
+    const userId = requireUserId();
+    return {
+      points: getUser(userId)!.points,
+      xp: getUser(userId)!.xp,
+      proficiency: getProficiency(userId),
+      upkeepDays: listUpkeepDays(userId),
+      config: getUpkeepConfig(userId),
+      achievements: unlockedAchievementIds(userId),
+    };
+  },
+};
+
+if (typeof window !== "undefined") {
+  (window as any).__upkeepDev = __upkeepDev;
 }

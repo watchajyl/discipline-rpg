@@ -171,6 +171,7 @@ export function invalidateAll(userId: number) {
     "/api/stats",
     "/api/rewards",
     "/api/redemptions",
+    "/api/upkeep",
   ]) {
     queryClient.invalidateQueries({ queryKey: [key, userId] });
   }

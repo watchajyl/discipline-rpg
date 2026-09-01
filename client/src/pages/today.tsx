@@ -7,6 +7,7 @@ import type { Profile, TaskFull } from "@/lib/types";
 import { Bar, CategoryChip, EmptyState, Num, PageHeader, Ring, SkeletonBlock, catColor, formatMinutes } from "@/components/bits";
 import { TaskCard } from "@/components/task-card";
 import { TaskFormSheet } from "@/components/task-form";
+import { UpkeepCard } from "@/components/upkeep-card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -113,6 +114,9 @@ export default function TodayPage() {
           </Button>
         }
       />
+
+      {/* 今日维持（V2） */}
+      <UpkeepCard />
 
       {/* 备份提醒 */}
       {profile?.backup?.due && !backupHidden && (

@@ -226,8 +226,16 @@ export function EmptyState({
   );
 }
 
-export function Num({ children, className }: { children: ReactNode; className?: string }) {
-  return <span className={cn("num", className)}>{children}</span>;
+export function Num({
+  children,
+  className,
+  "data-testid": testId,
+}: { children: ReactNode; className?: string; "data-testid"?: string }) {
+  return (
+    <span className={cn("num", className)} data-testid={testId}>
+      {children}
+    </span>
+  );
 }
 
 export function SkeletonBlock({ className }: { className?: string }) {

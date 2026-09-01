@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Logo, Num } from "@/components/bits";
+import { ACHIEVEMENTS } from "@shared/achievements";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Loader2, ShieldQuestion, Sparkles, AlertTriangle } from "lucide-react";
 import { CATEGORIES } from "@shared/gameRules";
@@ -286,7 +287,7 @@ export default function AuthPage() {
           ))}
         </div>
         <p className="mt-3 text-center text-[11px] text-muted-foreground leading-relaxed">
-          五大类别独立熟练度 · <Num>4</Num> 种结算模式 · <Num>36</Num> 条成就 · <Num>30</Num> 节点成长树
+          五大类别独立熟练度 · <Num>4</Num> 种结算模式 · <Num>{ACHIEVEMENTS.length}</Num> 条成就 · <Num>30</Num> 节点成长树
         </p>
       </div>
     </div>
