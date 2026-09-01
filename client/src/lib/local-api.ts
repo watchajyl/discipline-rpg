@@ -154,3 +154,19 @@ export async function localFetch(method: string, url: string, body?: unknown): P
   }
   return json({ message: `未知接口：${upper} ${path}` }, 404);
 }
+
+// 自测桥：让 Playwright 走与 UI 完全相同的 method + URL 路径发起操作。
+// 只暴露读写既有路由的能力，不含任何新数值逻辑。
+if (typeof window !== "undefined") {
+  (window as any).__api = async (method: string, url: string, body?: unknown) => {
+    const res = await localFetch(method, url, body);
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    return { status: res.status, data };
+  };
+}
