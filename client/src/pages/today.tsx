@@ -7,6 +7,7 @@ import type { Profile, TaskFull } from "@/lib/types";
 import { Bar, CategoryChip, EmptyState, Num, PageHeader, Ring, SkeletonBlock, catColor, formatMinutes } from "@/components/bits";
 import { TaskCard } from "@/components/task-card";
 import { TaskFormSheet } from "@/components/task-form";
+import { MigrationHintCard } from "@/components/sync-settings";
 import { UpkeepCard } from "@/components/upkeep-card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -98,6 +99,7 @@ export default function TodayPage() {
 
   return (
     <div>
+      <MigrationHintCard />
       <PageHeader
         title="今日面板"
         desc={`${new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" })} · ${motivation}`}
