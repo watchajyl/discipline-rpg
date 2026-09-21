@@ -8,6 +8,11 @@ export class ServerError extends Error {
   }
 }
 
+export function serverBaseUrl(): string {
+  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  return "";
+}
+
 function normalizeBaseUrl(url: string): string {
   const clean = String(url || "").trim().replace(/\/$/, "");
   if (!/^https?:\/\//.test(clean)) throw new ServerError("服务器地址需要以 http:// 或 https:// 开头");

@@ -1,6 +1,5 @@
-import { useEffect, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
+import { useState } from "react";
+import { useMutation } from "@tanstack/react-query";
 import { useApp } from "@/lib/app-context";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
@@ -8,120 +7,28 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Logo, Num } from "@/components/bits";
 import { ACHIEVEMENTS } from "@shared/achievements";
-import { Loader2, ShieldQuestion, Sparkles, AlertTriangle, HardDrive, Cloud } from "lucide-react";
+import { Loader2, Sparkles, Cloud } from "lucide-react";
 import { CATEGORIES } from "@shared/gameRules";
 import { cloudSignIn, cloudSignUp } from "@/lib/cloud-auth";
 
-type Track = "online" | "local";
-type Mode = "login" | "register" | "reset";
-
 export default function AuthPage() {
-  const { setSession, storageOk } = useApp();
+  const { setSession } = useApp();
   const { toast } = useToast();
-  const { data: boot, isLoading } = useQuery<{ hasUsers: boolean }>({ queryKey: ["/api/bootstrap"] });
-  const [track, setTrack] = useState<Track>("online");
-  const [mode, setMode] = useState<Mode>("login");
-
-  const [serverUrl, setServerUrl] = useState("https://39.96.116.94.sslip.io");
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
-  const [onlinePassword, setOnlinePassword] = useState("");
-  const [onlineMode, setOnlineMode] = useState<"login" | "register">("login");
-
-  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [question, setQuestion] = useState("我的第一位导师姓什么？");
-  const [answer, setAnswer] = useState("");
-  const [resetQuestion, setResetQuestion] = useState("");
-  const [newPassword, setNewPassword] = useState("");
 
-  useEffect(() => {
-    if (track === "local" && boot && !boot.hasUsers) setMode("register");
-  }, [boot, track]);
-
-  const onlineLogin = useMutation({
-    mutationFn: () => cloudSignIn(serverUrl, email, onlinePassword),
-    onSuccess: (d) => {
-      toast({ title: "已登录在线账号", description: "正在同步云端最新数据…" });
-      setSession(d.user, d.token);
-    },
-    onError: (e: any) => toast({ title: "登录失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const onlineRegister = useMutation({
-    mutationFn: () => cloudSignUp(serverUrl, email, onlinePassword),
-    onSuccess: (d) => {
-      toast({ title: "在线账号已创建", description: "现在开始实时记录和云存档。" });
-      setSession(d.user, d.token);
-    },
-    onError: (e: any) => toast({ title: "注册失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const localLogin = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/login", { username, password, remember: true });
-      return await res.json();
-    },
-    onSuccess: (d) => setSession(d.user, d.token ?? null),
-    onError: (e: any) => toast({ title: "登录失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const localRegister = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/register", {
-        username,
-        password,
-        displayName,
-        securityQuestion: question,
-        securityAnswer: answer,
-        remember: true,
-      });
-      return await res.json();
-    },
-    onSuccess: (d) => {
-      toast({ title: "本地账号已创建", description: "数据保存在本浏览器。" });
-      setSession(d.user, d.token ?? null);
-    },
-    onError: (e: any) => toast({ title: "注册失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const fetchQuestion = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("GET", `/api/security-question/${encodeURIComponent(username)}`);
-      return await res.json();
-    },
-    onSuccess: (d) => setResetQuestion(d.question || "（该账号未设置安全问题）"),
-    onError: (e: any) => toast({ title: "查询失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const localReset = useMutation({
-    mutationFn: async () => {
-      await apiRequest("POST", "/api/reset-password", { username, answer, newPassword });
-    },
-    onSuccess: () => {
-      toast({ title: "密码已重置", description: "请用新密码登录。" });
-      setMode("login");
-      setPassword("");
-    },
-    onError: (e: any) => toast({ title: "重置失败", description: cleanErr(e), variant: "destructive" }),
-  });
-
-  const demo = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/demo-account", {});
-      return await res.json();
-    },
+  const submit = useMutation({
+    mutationFn: async () => (mode === "login" ? cloudSignIn(email, password) : cloudSignUp(email, password)),
     onSuccess: (d) => {
       toast({
-        title: "演示数据已载入",
-        description: `本地账号 ${d.username} / 密码 ${d.password}，可直接查看图表与面板。`,
+        title: mode === "login" ? "已登录在线账号" : "在线账号已创建",
+        description: "正在同步云端最新数据…",
       });
-      setSession(d.user, d.token ?? null);
+      setSession(d.user, d.token);
     },
-    onError: (e: any) => toast({ title: "载入失败", description: cleanErr(e), variant: "destructive" }),
+    onError: (e: any) => toast({ title: mode === "login" ? "登录失败" : "注册失败", description: cleanErr(e), variant: "destructive" }),
   });
-
-  const onlineBusy = onlineLogin.isPending || onlineRegister.isPending;
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10 paper-grain">
@@ -133,110 +40,50 @@ export default function AuthPage() {
           <div className="min-w-0">
             <h1 className="text-xl font-bold leading-tight">自律成长系统</h1>
             <p className="text-xs text-muted-foreground leading-tight">
-              沉静的学者书房 × RPG 状态面板 · 无惩罚，只做正向督促
+              在线实时存档 · 多设备同步 · 无惩罚正向督促
             </p>
           </div>
         </div>
 
-        {!storageOk && (
-          <div className="mb-4 flex items-start gap-2.5 rounded-lg border border-chart-4/40 bg-chart-4/10 p-3">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-chart-4" />
-            <p className="min-w-0 flex-1 text-xs leading-relaxed">
-              当前环境不支持本地存储，数据仅保存在本次会话中。
-            </p>
-          </div>
-        )}
-
         <div className="rounded-2xl border border-card-border bg-card p-5 shadow-lg sm:p-6">
-          <div className="mb-5 grid grid-cols-2 gap-1 rounded-xl bg-muted p-1">
-            <TrackTab active={track === "online"} icon={Cloud} label="在线账号" testId="tab-track-online" onClick={() => setTrack("online")} />
-            <TrackTab active={track === "local"} icon={HardDrive} label="本地模式" testId="tab-track-local" onClick={() => {
-              setTrack("local");
-              setMode(boot && !boot.hasUsers ? "register" : "login");
-            }} />
+          <div className="space-y-4">
+            <div>
+              <p className="flex items-center gap-1.5 text-base font-semibold">
+                <Cloud className="h-4 w-4 text-primary" />
+                {mode === "login" ? "登录在线账号" : "注册在线账号"}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                所有数据直接保存在在线账号里，换设备登录同一邮箱即可继续。
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="auth-email">邮箱</Label>
+              <Input id="auth-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} data-testid="input-online-email" />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auth-password">密码</Label>
+              <Input id="auth-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} data-testid="input-online-password" />
+            </div>
+
+            <Button
+              className="w-full"
+              disabled={submit.isPending || !email || password.length < 6}
+              onClick={() => submit.mutate()}
+              data-testid="button-online-submit"
+            >
+              {submit.isPending && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+              {mode === "login" ? "登录并同步" : "注册并进入"}
+            </Button>
+
+            <button
+              className="w-full text-center text-xs text-muted-foreground underline-offset-4 hover:underline"
+              onClick={() => setMode((v) => (v === "login" ? "register" : "login"))}
+              data-testid="button-online-switch-mode"
+            >
+              {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
+            </button>
           </div>
-
-          {isLoading ? (
-            <div className="flex h-40 items-center justify-center text-muted-foreground">
-              <Loader2 className="h-5 w-5 animate-spin" />
-            </div>
-          ) : track === "online" ? (
-            <div className="space-y-4">
-              <div>
-                <p className="text-base font-semibold">{onlineMode === "login" ? "登录在线账号" : "注册在线账号"}</p>
-                <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                  数据实时保存在自托管后端，换设备登录同一邮箱即可继承最新云存档。
-                </p>
-              </div>
-              <Field label="服务器地址" value={serverUrl} onChange={setServerUrl} testId="input-online-server" />
-              <Field label="邮箱" value={email} onChange={setEmail} type="email" testId="input-online-email" />
-              <Field label="密码" value={onlinePassword} onChange={setOnlinePassword} type="password" testId="input-online-password" />
-              <Button
-                className="w-full"
-                onClick={() => (onlineMode === "login" ? onlineLogin.mutate() : onlineRegister.mutate())}
-                disabled={onlineBusy || !serverUrl || !email || onlinePassword.length < 6}
-                data-testid="button-online-submit"
-              >
-                {onlineBusy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-                {onlineMode === "login" ? "登录并同步" : "注册并同步"}
-              </Button>
-              <button
-                className="w-full text-center text-xs text-muted-foreground underline-offset-4 hover:underline"
-                onClick={() => setOnlineMode((v) => (v === "login" ? "register" : "login"))}
-                data-testid="button-online-switch-mode"
-              >
-                {onlineMode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
-              </button>
-            </div>
-          ) : mode === "reset" ? (
-            <div className="space-y-4">
-              <p className="text-base font-semibold">通过安全问题重置密码</p>
-              <Field label="用户名" value={username} onChange={setUsername} testId="input-reset-username" />
-              <Button variant="secondary" className="w-full" onClick={() => fetchQuestion.mutate()} disabled={!username || fetchQuestion.isPending}>
-                <ShieldQuestion className="mr-1.5 h-4 w-4" />
-                获取安全问题
-              </Button>
-              {resetQuestion && <p className="rounded-lg bg-muted px-3 py-2 text-sm leading-relaxed">{resetQuestion}</p>}
-              <Field label="答案" value={answer} onChange={setAnswer} testId="input-reset-answer" />
-              <Field label="新密码" value={newPassword} onChange={setNewPassword} type="password" testId="input-reset-new-password" />
-              <Button className="w-full" onClick={() => localReset.mutate()} disabled={localReset.isPending}>重置密码</Button>
-              <button className="w-full text-center text-xs text-muted-foreground underline-offset-4 hover:underline" onClick={() => setMode("login")}>返回登录</button>
-            </div>
-          ) : mode === "register" ? (
-            <div className="space-y-4">
-              <p className="text-base font-semibold">创建本地账号</p>
-              <p className="mt-1 text-xs text-muted-foreground leading-relaxed">数据保存在本浏览器，不上传服务器。</p>
-              <Field label="用户名" value={username} onChange={setUsername} testId="input-register-username" />
-              <Field label="显示名称（可选）" value={displayName} onChange={setDisplayName} testId="input-register-displayname" />
-              <Field label="密码（至少 6 位）" value={password} onChange={setPassword} type="password" testId="input-register-password" />
-              <Field label="安全问题" value={question} onChange={setQuestion} testId="input-register-question" />
-              <Field label="安全问题答案" value={answer} onChange={setAnswer} testId="input-register-answer" />
-              <Button className="w-full" onClick={() => localRegister.mutate()} disabled={localRegister.isPending}>创建并进入</Button>
-              {boot?.hasUsers && (
-                <button className="w-full text-center text-xs text-muted-foreground underline-offset-4 hover:underline" onClick={() => setMode("login")}>已有本地账号？返回登录</button>
-              )}
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <p className="text-base font-semibold">登录本地账号</p>
-              <Field label="用户名" value={username} onChange={setUsername} testId="input-login-username" />
-              <Field label="密码" value={password} onChange={setPassword} type="password" testId="input-login-password" />
-              <Button className="w-full" onClick={() => localLogin.mutate()} disabled={localLogin.isPending}>进入系统</Button>
-              <div className="flex items-center justify-between gap-2 text-xs">
-                <button className="text-muted-foreground underline-offset-4 hover:underline" onClick={() => setMode("reset")}>忘记密码？</button>
-                <button className="text-muted-foreground underline-offset-4 hover:underline" onClick={() => setMode("register")}>创建新账号</button>
-              </div>
-            </div>
-          )}
-
-          {track === "local" && mode !== "reset" && (
-            <div className="mt-4 border-t border-card-border pt-4">
-              <Button variant="outline" className="w-full" onClick={() => demo.mutate()} disabled={demo.isPending}>
-                {demo.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Sparkles className="mr-1.5 h-4 w-4" />}
-                载入演示数据
-              </Button>
-            </div>
-          )}
         </div>
 
         <div className="mt-5 grid grid-cols-5 gap-1.5">
@@ -251,32 +98,6 @@ export default function AuthPage() {
           五大类别独立熟练度 · <Num>4</Num> 种结算模式 · <Num>{ACHIEVEMENTS.length}</Num> 条成就 · <Num>30</Num> 节点成长树
         </p>
       </div>
-    </div>
-  );
-}
-
-function TrackTab({ active, icon: Icon, label, testId, onClick }: { active: boolean; icon: typeof Cloud; label: string; testId: string; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      data-testid={testId}
-      aria-pressed={active}
-      className={
-        "flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm transition-colors " +
-        (active ? "bg-card font-semibold text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")
-      }
-    >
-      <Icon className="h-4 w-4 shrink-0" />
-      <span className="truncate">{label}</span>
-    </button>
-  );
-}
-
-function Field({ label, value, onChange, type = "text", testId }: { label: string; value: string; onChange: (v: string) => void; type?: string; testId: string }) {
-  return (
-    <div className="space-y-1.5">
-      <Label htmlFor={testId}>{label}</Label>
-      <Input id={testId} type={type} value={value} onChange={(e) => onChange(e.target.value)} data-testid={testId} />
     </div>
   );
 }

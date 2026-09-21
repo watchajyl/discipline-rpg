@@ -15,13 +15,12 @@ export function ServerSyncSection() {
   const { user, setUser, isCloud } = useApp();
   const userId = user?.id ?? 0;
   const { toast } = useToast();
-  const [serverUrl, setServerUrl] = useState(user?.cloudUserId ? "" : "https://你的域名或服务器地址");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [mode, setMode] = useState<"login" | "register">("login");
 
   const connect = useMutation({
-    mutationFn: async () => (mode === "register" ? cloudSignUp(serverUrl, email, password) : cloudSignIn(serverUrl, email, password)),
+    mutationFn: async () => (mode === "register" ? cloudSignUp(email, password) : cloudSignIn(email, password)),
     onSuccess: async (d) => {
       setUser(d.user);
       setPassword("");
@@ -75,18 +74,6 @@ export function ServerSyncSection() {
             输入你部署的自托管后端地址、邮箱和密码。第一次使用先选“注册”，之后换设备选“登录”即可继承同一份云存档。
           </p>
           <div className="grid grid-cols-1 gap-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="server-url" className="text-xs">
-                服务器地址
-              </Label>
-              <Input
-                id="server-url"
-                value={serverUrl}
-                onChange={(e) => setServerUrl(e.target.value)}
-                placeholder="https://你的域名"
-                data-testid="input-server-url"
-              />
-            </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="server-email" className="text-xs">
@@ -110,7 +97,7 @@ export function ServerSyncSection() {
             >
               {mode === "login" ? "切换到注册" : "切换到登录"}
             </Button>
-            <Button disabled={connect.isPending || !serverUrl || !email || password.length < 6} onClick={() => connect.mutate()} data-testid="button-server-connect">
+            <Button disabled={connect.isPending || !email || password.length < 6} onClick={() => connect.mutate()} data-testid="button-server-connect">
               {connect.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Link2 className="mr-1.5 h-4 w-4" />}
               {mode === "login" ? "连接并同步" : "注册并同步"}
             </Button>

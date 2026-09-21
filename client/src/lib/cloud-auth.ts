@@ -1,5 +1,5 @@
 // V0.6：自托管在线后端认证。用户在设置页配置服务器地址、邮箱和密码。
-import { serverLogin, serverRegister, serverMe } from "./server-api";
+import { serverBaseUrl, serverLogin, serverRegister, serverMe } from "./server-api";
 import { serverConnectCurrent, serverCurrentUser } from "./localdb";
 
 export type CloudSession = {
@@ -10,10 +10,10 @@ export type CloudSession = {
 };
 
 export async function cloudSignIn(
-  serverUrl: string,
   email: string,
   password: string,
 ): Promise<CloudSession> {
+  const serverUrl = serverBaseUrl();
   const data = await serverLogin(serverUrl, email, password);
   const token = String(data.token || "");
   const id = String(data.user?.id || "");
@@ -28,10 +28,10 @@ export async function cloudSignIn(
 }
 
 export async function cloudSignUp(
-  serverUrl: string,
   email: string,
   password: string,
 ): Promise<CloudSession> {
+  const serverUrl = serverBaseUrl();
   const data = await serverRegister(serverUrl, email, password);
   const token = String(data.token || "");
   const id = String(data.user?.id || "");
