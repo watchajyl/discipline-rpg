@@ -11,12 +11,18 @@ import {
   resetSchema,
   type InsertReward,
   type InsertTask,
+  type FocusTimer,
+  type Expense,
+  type JournalEntry,
   type Log,
   type Milestone,
+  type PlannerMessage,
+  type PlannerSession,
   type ProficiencyRow,
   type Redemption,
   type Reward,
   type Session,
+  type SleepLog,
   type SkillNodeRow,
   type Task,
   type Timer,
@@ -38,12 +44,19 @@ import {
   levelFromXp,
   levelProgress,
   levelTitle,
+  metricName,
+  modeName,
+  normalizeTaskTarget,
   periodKey,
   proficiencyTier,
+  repeatName,
+  ruleTargetFor,
   ruleSuggest,
+  urgencyMultiplier,
   weekKey,
 } from "@shared/gameRules";
 import { ACHIEVEMENTS, isAchieved, RARITY_META, V1_ACHIEVEMENT_COUNT, type AchievementSnapshot } from "@shared/achievements";
+import { OVERWORK_MULT, recommendedWorkMinutes, sleepScore, timeToMinutes, workLimitReason } from "@shared/sleep";
 import {
   addDays,
   applyDailyCap,
@@ -95,6 +108,18 @@ type DbDoc = {
   rewards: Reward[];
   redemptions: Redemption[];
   timers: Timer[];
+  /** V3：全局专注计时器（每个账号一条，本地状态，不随云端同步） */
+  focusTimers: FocusTimer[];
+  /** V4：复盘日记与未来规划（本地保存） */
+  journals: JournalEntry[];
+  /** V0.2：睡眠记录（本地保存，结算流水仍走 settlement_logs） */
+  sleepLogs: SleepLog[];
+  /** V0.2：每账号的理想睡眠设置 */
+  sleepSettings: Record<number, { idealBedtime: string; idealSleepHours: number }>;
+  /** V0.3：开销流水（本地保存，预算完成情况写入结算日志） */
+  expenses: Expense[];
+  /** V0.4：智能规划聊天会话（本地保存） */
+  plannerSessions: PlannerSession[];
   /** 「记住登录状态」持久化的活动会话 token */
   rememberedToken: string | null;
   /** 每个账号最近一次导出备份的时间 */
@@ -142,6 +167,12 @@ function emptyDoc(): DbDoc {
     rewards: [],
     redemptions: [],
     timers: [],
+    focusTimers: [],
+    journals: [],
+    sleepLogs: [],
+    sleepSettings: {},
+    expenses: [],
+    plannerSessions: [],
     rememberedToken: null,
     lastBackupAt: {},
     upkeepDays: [],
@@ -329,6 +360,17 @@ function allLogs(userId: number): Log[] {
   return doc.logs.filter((l) => l.userId === userId);
 }
 
+/** 只有时间块 / 手动补记 / 番茄钟才计入专注时长；睡眠、娱乐、任务流水不算 */
+const FOCUS_LOG_KINDS = new Set(["block", "manual", "focus", "focus_effort"]);
+
+function isFocusLog(l: Log): boolean {
+  return FOCUS_LOG_KINDS.has(l.kind);
+}
+
+function focusMinutesOf(l: Log): number {
+  return isFocusLog(l) ? Math.max(0, l.minutes) : 0;
+}
+
 function unlockedNodes(userId: number): string[] {
   return doc.skillNodes.filter((n) => n.userId === userId).map((n) => n.nodeId);
 }
@@ -360,6 +402,67 @@ function periodCheckins(task: Task): number {
   return doc.logs.filter(
     (l) => l.taskId === task.id && l.kind === "checkin" && periodKey(period, new Date(l.day + "T12:00:00")) === cur,
   ).length;
+}
+
+/** V3：按任务口径计算当前周期（或累计）进度；extra 用于结算前的预测 */
+function taskMetricProgress(userId: number, task: Task, extra = 0): { current: number; target: number } {
+  const { repeat, metric, amount } = normalizeTaskTarget(task);
+  const logs = allLogs(userId).filter((l) => l.taskId === task.id);
+  const curKey = repeat === "none" ? null : periodKey(repeat as "daily" | "weekly");
+  const inPeriod = curKey
+    ? logs.filter((l) => periodKey(repeat as "daily" | "weekly", new Date(l.day + "T12:00:00")) === curKey)
+    : logs;
+  let current = 0;
+  if (metric === "checkin") {
+    current = inPeriod.filter((l) => l.kind === "checkin" || l.kind === "makeup").length;
+  } else if (metric === "blocks") {
+    current = inPeriod
+      .filter((l) => l.kind === "block" || l.kind === "manual")
+      .reduce((a, l) => a + Math.max(1, Math.round(l.ratio)), 0);
+  } else {
+    current =
+      repeat === "none"
+        ? task.currentCount ?? 0
+        : inPeriod.filter((l) => l.kind === "count").reduce((a, l) => a + Math.max(0, Math.round(l.ratio)), 0);
+  }
+  return { current: current + extra, target: amount };
+}
+
+/** V3：habit 模式达到本期目标后的下一段连续数（不落盘） */
+function habitStreakNext(
+  task: Task,
+  userId: number,
+  extra = 0,
+): { streak: number; changed: boolean; message: string } {
+  if (task.mode !== "habit") return { streak: effectiveStreak(task), changed: false, message: "" };
+  const repeat = task.period as "daily" | "weekly";
+  const curKey = periodKey(repeat);
+  if (task.lastPeriodKey === curKey) return { streak: task.streak, changed: false, message: "" };
+  const { current, target } = taskMetricProgress(userId, task, extra);
+  if (current < target) return { streak: effectiveStreak(task), changed: false, message: "" };
+  if (task.lastPeriodKey && isConsecutivePeriod(repeat, task.lastPeriodKey, curKey)) {
+    return { streak: task.streak + 1, changed: true, message: "" };
+  }
+  return { streak: 1, changed: true, message: task.streak >= 3 ? "从今天重新开始，前面积累的熟练度一分没少。" : "" };
+}
+
+function commitHabitStreak(task: Task, next: { streak: number; changed: boolean; message: string }) {
+  if (task.mode !== "habit" || !next.changed) return;
+  task.streak = next.streak;
+  task.bestStreak = Math.max(task.bestStreak, next.streak);
+  task.lastPeriodKey = task.period === "weekly" ? periodKey("weekly") : periodKey("daily");
+}
+
+function maybeArchiveOneShot(task: Task, userId: number) {
+  if (task.archived === 1 || task.finishOnTarget !== 1) return false;
+  const { repeat } = normalizeTaskTarget(task);
+  if (repeat !== "none") return false;
+  const { current, target } = taskMetricProgress(userId, task);
+  if (current >= target) {
+    task.archived = 1;
+    return true;
+  }
+  return false;
 }
 
 // ---------------- 计时器 ----------------
@@ -420,23 +523,48 @@ function deleteTimer(userId: number, taskId: number) {
   doc.timers = doc.timers.filter((t) => !(t.userId === userId && t.taskId === taskId));
 }
 
+// ---------------- 全局专注计时器（V3） ----------------
+function getFocusTimer(userId: number): FocusTimer | undefined {
+  return doc.focusTimers.find((t) => t.userId === userId);
+}
+
+function focusElapsedMs(t: FocusTimer): number {
+  return t.accumulatedMs + (t.running && t.startedAt ? Date.now() - t.startedAt : 0);
+}
+
+function deleteFocusTimer(userId: number) {
+  doc.focusTimers = doc.focusTimers.filter((t) => t.userId !== userId);
+}
+
 // ---------------- 视图 ----------------
 function taskView(userId: number, t: Task) {
   const ms = parseMilestones(t);
-  const timer = t.mode === "timer" ? getTimer(userId, t.id) : undefined;
+  const target = normalizeTaskTarget(t);
+  const isTimerLike = t.mode === "timer" || (t.mode === "habit" && target.metric === "blocks");
+  const timer = isTimerLike ? getTimer(userId, t.id) : undefined;
   const todayLogs = allLogs(userId).filter((l) => l.taskId === t.id && l.day === dateKey());
+  const progress = taskMetricProgress(userId, t);
   return {
     ...t,
+    repeat: target.repeat,
+    targetMetric: target.metric,
+    targetAmount: target.amount,
+    finishOnTarget: t.finishOnTarget ?? 0,
     milestones: ms,
     effectiveStreak: t.mode === "habit" ? effectiveStreak(t) : 0,
     periodCheckins: t.mode === "habit" ? periodCheckins(t) : 0,
     todayBlocks:
-      t.mode === "timer"
+      isTimerLike
         ? todayLogs
             .filter((l) => l.kind === "block" || l.kind === "manual")
             .reduce((a, l) => a + Math.max(1, Math.round(l.ratio)), 0)
         : 0,
     todayXp: todayLogs.reduce((a, l) => a + l.xp, 0),
+    targetProgress: {
+      current: progress.current,
+      target: progress.target,
+      label: `${repeatName(target.repeat)} · ${metricName(target.metric)}`,
+    },
     timer: timer
       ? { running: !!timer.running, elapsedMs: elapsedMs(timer), startedAt: timer.startedAt, accumulatedMs: timer.accumulatedMs }
       : null,
@@ -458,6 +586,8 @@ async function publicUser(id: number) {
     aiBaseUrl: u.aiBaseUrl,
     aiModel: u.aiModel,
     aiKeyMasked: maskKey(plainKey),
+    githubConfigured: !!u.githubToken,
+    githubRepo: u.githubRepo || "",
     securityQuestion: u.securityQuestion,
     cloudUserId: u.cloudUserId ?? null,
     email: u.email ?? "",
@@ -471,7 +601,7 @@ function todayTotals(userId: number) {
   return {
     xp: rows.reduce((a, r) => a + r.xp, 0),
     points: rows.reduce((a, r) => a + r.points, 0),
-    minutes: rows.reduce((a, r) => a + r.minutes, 0),
+    minutes: rows.reduce((a, r) => a + focusMinutesOf(r), 0),
     settlements: rows.filter((r) => r.xp > 0).length,
     categories: cats,
   };
@@ -485,7 +615,7 @@ function buildSnapshot(userId: number): AchievementSnapshot {
   const byWeek = new Map<string, Set<string>>();
   let totalMinutes = 0;
   for (const l of logsAll) {
-    totalMinutes += l.minutes;
+    totalMinutes += focusMinutesOf(l);
     if (l.xp > 0) {
       if (!byDay.has(l.day)) byDay.set(l.day, new Set());
       byDay.get(l.day)!.add(l.taskId);
@@ -559,6 +689,7 @@ function applySettlement(opts: {
   ignoreStreak?: boolean;
   streakOverride?: number;
   sign?: 1 | -1;
+  scale?: number;
 }): { xp: number; points: number; prof: number; streakMul: number } {
   const { userId, task } = opts;
   const sign = opts.sign ?? 1;
@@ -567,6 +698,7 @@ function applySettlement(opts: {
   const dayLogs = allLogs(userId).filter((l) => l.day === day);
   const crossCategoryToday = dayLogs.some((l) => l.category !== task.category && l.xp > 0);
   const streak = opts.ignoreStreak ? 0 : opts.streakOverride ?? effectiveStreak(task);
+  const urgencyMul = urgencyMultiplier(task.deadline || task.endDate, task.priority, day);
 
   const res = computeSettlement({
     xpPerUnit: task.xpPerUnit,
@@ -578,10 +710,12 @@ function applySettlement(opts: {
     streak: opts.ignoreStreak ? 0 : streak,
     effects,
     crossCategoryToday,
+    urgencyMul,
   });
 
-  const xp = res.xp * sign;
-  const points = res.points * sign;
+  const scale = opts.scale ?? 1;
+  const xp = Math.round(res.xp * scale) * sign;
+  const points = Math.round(res.points * scale) * sign;
   const prof = res.prof * sign;
   const minutes = (opts.minutes ?? 0) * sign;
 
@@ -622,6 +756,45 @@ function finishBonus(userId: number, task: Task, sign: 1 | -1 = 1) {
     sign,
   });
   return { xp: r.xp, points: r.points, prof: r.prof };
+}
+
+/** 自由专注 / 努力奖励 / 娱乐超时调整的落账（仍是只追加流水） */
+function pushFocusLog(opts: {
+  userId: number;
+  taskId: number | null;
+  taskTitle: string;
+  category: string;
+  mode: string;
+  kind: string;
+  xp: number;
+  points: number;
+  prof: number;
+  minutes: number;
+  note: string;
+  day?: string;
+}) {
+  const user = getUser(opts.userId)!;
+  user.xp = Math.max(0, user.xp + opts.xp);
+  user.points = Math.max(0, user.points + opts.points);
+  if (opts.prof !== 0) addProficiency(opts.userId, opts.category, opts.prof);
+  doc.logs.push({
+    id: nextId("logs"),
+    uid: newUid(),
+    userId: opts.userId,
+    taskId: opts.taskId ?? 0,
+    taskTitle: opts.taskTitle,
+    category: opts.category,
+    mode: opts.mode,
+    kind: opts.kind,
+    day: opts.day ?? dateKey(),
+    xp: opts.xp,
+    points: opts.points,
+    prof: opts.prof,
+    minutes: opts.minutes,
+    ratio: opts.minutes > 0 ? Math.max(0, opts.minutes / 60) : opts.points < 0 ? -1 : 0,
+    note: opts.note,
+    createdAt: Date.now(),
+  });
 }
 
 // ---------------- 账号 ----------------
@@ -675,6 +848,11 @@ function createTaskRecord(userId: number, data: InsertTask): Task {
     weight: m.weight || 1,
     done: false,
   }));
+  const target = normalizeTaskTarget({ ...data, mode: data.mode });
+  const repeat = data.repeat ?? target.repeat;
+  const metric = data.targetMetric ?? target.metric;
+  const amount = data.targetAmount ?? target.amount;
+  const deadline = data.deadline || data.endDate || "";
   const t: Task = {
     id: nextId("tasks"),
     userId,
@@ -687,7 +865,7 @@ function createTaskRecord(userId: number, data: InsertTask): Task {
     profPerUnit: data.profPerUnit,
     notes: data.notes ?? "",
     startDate: data.startDate ?? "",
-    endDate: data.endDate ?? "",
+    endDate: data.endDate || deadline,
     archived: 0,
     blockMinutes: data.blockMinutes,
     dailyTargetBlocks: data.dailyTargetBlocks,
@@ -702,7 +880,21 @@ function createTaskRecord(userId: number, data: InsertTask): Task {
     targetCount: data.targetCount,
     currentCount: 0,
     createdAt: Date.now(),
+    repeat,
+    targetMetric: metric,
+    targetAmount: amount,
+    finishOnTarget: data.finishOnTarget ?? 0,
+    priority: data.priority ?? 0,
+    deadline,
+    dailyBudgetCents: data.dailyBudgetCents,
   };
+  // 让旧字段与新口径保持同步，云端旧列与旧版本 UI 都能继续工作
+  if (t.mode === "timer") t.dailyTargetBlocks = amount;
+  if (t.mode === "habit") {
+    t.period = repeat;
+    if (metric === "checkin") t.targetPerPeriod = amount;
+  }
+  if (t.mode === "count") t.targetCount = amount;
   doc.tasks.push(t);
   return t;
 }
@@ -711,11 +903,17 @@ function clearUserData(userId: number) {
   doc.tasks = doc.tasks.filter((t) => t.userId !== userId);
   doc.logs = doc.logs.filter((l) => l.userId !== userId);
   doc.timers = doc.timers.filter((t) => t.userId !== userId);
+  doc.focusTimers = doc.focusTimers.filter((t) => t.userId !== userId);
   doc.achievements = doc.achievements.filter((a) => a.userId !== userId);
   doc.skillNodes = doc.skillNodes.filter((n) => n.userId !== userId);
   doc.redemptions = doc.redemptions.filter((r) => r.userId !== userId);
   doc.upkeepDays = doc.upkeepDays.filter((r) => r.userId !== userId);
   doc.upkeepExemptions = doc.upkeepExemptions.filter((r) => r.userId !== userId);
+  doc.journals = doc.journals.filter((r) => r.userId !== userId);
+  doc.sleepLogs = doc.sleepLogs.filter((r) => r.userId !== userId);
+  delete doc.sleepSettings[userId];
+  doc.expenses = doc.expenses.filter((r) => r.userId !== userId);
+  doc.plannerSessions = doc.plannerSessions.filter((r) => r.userId !== userId);
   const u = getUser(userId);
   if (u) {
     u.xp = 0;
@@ -869,6 +1067,20 @@ export async function updateTask(id: number, body: any) {
   const partial = insertTaskSchema.partial().safeParse(body?.task ?? {});
   if (!partial.success) throw new LocalError(partial.error.issues[0]?.message ?? "参数有误");
   const patch: any = { ...partial.data };
+  if (partial.data.repeat !== undefined || partial.data.targetMetric !== undefined || partial.data.targetAmount !== undefined) {
+    const next = normalizeTaskTarget({ ...existing, ...partial.data, mode: existing.mode });
+    patch.repeat = next.repeat;
+    patch.targetMetric = next.metric;
+    patch.targetAmount = next.amount;
+    if (existing.mode === "timer") patch.dailyTargetBlocks = next.amount;
+    if (existing.mode === "habit") {
+      patch.period = next.repeat;
+      if (next.metric === "checkin") patch.targetPerPeriod = next.amount;
+    }
+    if (existing.mode === "count") patch.targetCount = next.amount;
+  }
+  if (partial.data.deadline !== undefined) patch.endDate = partial.data.deadline || patch.endDate || "";
+  if (partial.data.endDate !== undefined) patch.deadline = partial.data.endDate || patch.deadline || "";
   if (typeof body?.archived === "number") patch.archived = body.archived;
   if (partial.data.milestones) {
     const old = parseMilestones(existing);
@@ -940,6 +1152,12 @@ export async function timerAction(taskId: number, action: string) {
       }
       throw new LocalError("尚未满一个专注块");
     }
+    const target = normalizeTaskTarget(task);
+    const next =
+      task.mode === "habit" && target.metric === "blocks"
+        ? habitStreakNext(task, userId, blocks)
+        : null;
+    const guard = overworkScaleFor(userId, blocks * task.blockMinutes);
     const before = levelFromXp(getUser(userId)!.xp);
     const r = applySettlement({
       userId,
@@ -947,10 +1165,15 @@ export async function timerAction(taskId: number, action: string) {
       kind: "block",
       ratio: blocks,
       minutes: blocks * task.blockMinutes,
-      note: `完成 ${blocks} 个专注块`,
+      note: `完成 ${blocks} 个专注块${guard.over ? "（超过今日建议值，产出 20%）" : ""}`,
+      ignoreStreak: task.mode !== "habit",
+      streakOverride: next?.changed ? next.streak : undefined,
+      scale: guard.scale,
     });
+    commitHabitStreak(task, next ?? { streak: 0, changed: false, message: "" });
     if (action === "complete") deleteTimer(userId, taskId);
     else consumeTimer(userId, taskId, blocks * blockMs);
+    maybeArchiveOneShot(task, userId);
     const after = levelFromXp(getUser(userId)!.xp);
     const newAchievements = checkAchievements(userId);
     await persist();
@@ -960,7 +1183,7 @@ export async function timerAction(taskId: number, action: string) {
       blocks,
       levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
       newAchievements,
-      message: `完成 ${blocks} 个专注块`,
+      message: `完成 ${blocks} 个专注块${guard.over ? "（已超过今日建议专注时长，产出降至 20%，强烈建议休息）" : ""}`,
     };
   }
   throw new LocalError("未知操作");
@@ -975,6 +1198,15 @@ export async function manualTime(taskId: number, body: any) {
   const day = String(body?.day || dateKey());
   const blocks = Math.floor(minutes / task.blockMinutes);
   if (blocks < 1) throw new LocalError(`不足一个专注块（${task.blockMinutes} 分钟），无法结算`);
+  const target = normalizeTaskTarget(task);
+  const next =
+    task.mode === "habit" && target.metric === "blocks"
+      ? habitStreakNext(task, userId, blocks)
+      : null;
+  const guard =
+    day === dateKey()
+      ? overworkScaleFor(userId, blocks * task.blockMinutes)
+      : { scale: 1, over: false, cap: 0, todayMinutes: 0 };
   const before = levelFromXp(getUser(userId)!.xp);
   const r = applySettlement({
     userId,
@@ -983,8 +1215,13 @@ export async function manualTime(taskId: number, body: any) {
     ratio: blocks,
     minutes: blocks * task.blockMinutes,
     day,
-    note: `补记 ${minutes} 分钟`,
+    note: `补记 ${minutes} 分钟${guard.over ? "（超过今日建议值，产出 20%）" : ""}`,
+    ignoreStreak: task.mode !== "habit",
+    streakOverride: next?.changed ? next.streak : undefined,
+    scale: guard.scale,
   });
+  commitHabitStreak(task, next ?? { streak: 0, changed: false, message: "" });
+  maybeArchiveOneShot(task, userId);
   const after = levelFromXp(getUser(userId)!.xp);
   const newAchievements = checkAchievements(userId);
   await persist();
@@ -994,7 +1231,7 @@ export async function manualTime(taskId: number, body: any) {
     blocks,
     levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
     newAchievements,
-    message: `补记 ${blocks} 个专注块`,
+    message: `补记 ${blocks} 个专注块${guard.over ? "（已超过今日建议专注时长，产出降至 20%）" : ""}`,
   };
 }
 
@@ -1066,24 +1303,10 @@ export async function checkin(taskId: number, body: any) {
     if (diff < 0 || diff > MAKEUP_DAYS) throw new LocalError(`只能为过去 ${MAKEUP_DAYS} 天内的漏签补卡`);
   }
 
-  const period = task.period as "daily" | "weekly";
-  let streak = effectiveStreak(task);
-  let streakChanged = false;
-  let message = "";
-
-  if (!isMakeup) {
-    const doneThisPeriod = periodCheckins(task);
-    const curKey = periodKey(period);
-    if (doneThisPeriod + 1 >= task.targetPerPeriod && task.lastPeriodKey !== curKey) {
-      if (task.lastPeriodKey && isConsecutivePeriod(period, task.lastPeriodKey, curKey)) {
-        streak = task.streak + 1;
-      } else {
-        streak = 1;
-        if (task.streak >= 3) message = "从今天重新开始，前面积累的熟练度一分没少。";
-      }
-      streakChanged = true;
-    }
-  }
+  const next = isMakeup
+    ? { streak: 0, changed: false, message: "" }
+    : habitStreakNext(task, userId, 1);
+  const streak = isMakeup ? 0 : next.changed ? next.streak : effectiveStreak(task);
 
   const before = levelFromXp(getUser(userId)!.xp);
   const r = applySettlement({
@@ -1097,22 +1320,18 @@ export async function checkin(taskId: number, body: any) {
     streakOverride: isMakeup ? 0 : streak,
   });
 
-  if (streakChanged) {
-    task.streak = streak;
-    task.bestStreak = Math.max(task.bestStreak, streak);
-    task.lastPeriodKey = periodKey(period);
-  }
+  commitHabitStreak(task, next);
   const after = levelFromXp(getUser(userId)!.xp);
   const newAchievements = checkAchievements(userId);
   await persist();
   return {
     ok: true,
     gained: { xp: r.xp, points: r.points, prof: r.prof, minutes: 0 },
-    streak: streakChanged ? streak : effectiveStreak(task),
+    streak: next.changed ? next.streak : effectiveStreak(task),
     streakMul: r.streakMul,
     levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
     newAchievements,
-    message: message || (isMakeup ? `补签成功（补签不计入连续加成）` : `打卡成功 ${percent}%`),
+    message: next.message || (isMakeup ? `补签成功（补签不计入连续加成）` : `打卡成功 ${percent}%`),
   };
 }
 
@@ -1123,6 +1342,8 @@ export async function countUp(taskId: number, body: any) {
   const task = getTask(taskId);
   if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
   const delta = Math.max(1, Math.min(100000, Math.floor(Number(body?.delta ?? 1))));
+  const target = normalizeTaskTarget(task);
+  const next = task.mode === "habit" ? habitStreakNext(task, userId, delta) : null;
   const before = levelFromXp(getUser(userId)!.xp);
   const r = applySettlement({
     userId,
@@ -1130,16 +1351,19 @@ export async function countUp(taskId: number, body: any) {
     kind: "count",
     ratio: delta,
     note: `+${delta} ${task.unitName}`,
-    ignoreStreak: true,
+    ignoreStreak: task.mode !== "habit",
+    streakOverride: next?.changed ? next.streak : undefined,
   });
+  commitHabitStreak(task, next ?? { streak: 0, changed: false, message: "" });
   const newCount = task.currentCount + delta;
   const hadBonus = task.finishBonusGranted;
   task.currentCount = newCount;
   let bonus: { xp: number; points: number; prof: number } | null = null;
-  if (newCount >= task.targetCount && !hadBonus) {
+  if (target.repeat === "none" && newCount >= target.amount && !hadBonus) {
     bonus = finishBonus(userId, task);
     task.finishBonusGranted = 1;
   }
+  maybeArchiveOneShot(task, userId);
   const after = levelFromXp(getUser(userId)!.xp);
   const newAchievements = checkAchievements(userId);
   await persist();
@@ -1150,6 +1374,264 @@ export async function countUp(taskId: number, body: any) {
     levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
     newAchievements,
     message: `+${delta} ${task.unitName}`,
+  };
+}
+
+// ---------------- 全局专注计时器（V3 / 番茄钟） ----------------
+function focusView(userId: number) {
+  const t = getFocusTimer(userId);
+  if (!t) return { running: false, elapsedMs: 0, kind: "focus" as const, taskId: null, capMinutes: 60 };
+  return {
+    running: !!t.running,
+    elapsedMs: focusElapsedMs(t),
+    kind: t.kind,
+    taskId: t.taskId,
+    capMinutes: t.capMinutes,
+  };
+}
+
+export async function focusState() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return focusView(userId);
+}
+
+export async function focusStart(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const kind = body?.kind === "game" ? "game" : "focus";
+  const capMinutes = Math.max(10, Math.min(600, Math.floor(Number(body?.capMinutes) || 60)));
+  const taskId = body?.taskId ? Number(body.taskId) : null;
+  if (taskId != null) {
+    const task = getTask(taskId);
+    if (!task || task.userId !== userId) throw new LocalError("任务不存在", 404);
+  }
+  const existing = getFocusTimer(userId);
+  if (existing) {
+    if (existing.running) return { ok: true, timer: focusView(userId) };
+    existing.running = 1;
+    existing.startedAt = Date.now();
+    existing.updatedAt = Date.now();
+    await persist();
+    return { ok: true, timer: focusView(userId) };
+  }
+  const now = Date.now();
+  doc.focusTimers.push({
+    id: nextId("focusTimers"),
+    userId,
+    taskId,
+    kind,
+    startedAt: now,
+    accumulatedMs: 0,
+    running: 1,
+    capMinutes,
+    updatedAt: now,
+  });
+  await persist();
+  return { ok: true, timer: focusView(userId) };
+}
+
+export async function focusPause() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const t = getFocusTimer(userId);
+  if (!t || !t.running) return { ok: true, timer: focusView(userId) };
+  const now = Date.now();
+  t.accumulatedMs = focusElapsedMs(t);
+  t.running = 0;
+  t.startedAt = 0;
+  t.updatedAt = now;
+  await persist();
+  return { ok: true, timer: focusView(userId) };
+}
+
+export async function focusAbandon() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  deleteFocusTimer(userId);
+  await persist();
+  return { ok: true, timer: focusView(userId), message: "已放弃本次计时，没有任何结算。" };
+}
+
+export async function focusStop(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const t = getFocusTimer(userId);
+  if (!t) throw new LocalError("没有正在运行的计时器");
+  const before = levelFromXp(getUser(userId)!.xp);
+  const elapsedMs = focusElapsedMs(t);
+  const minutes = Math.floor(elapsedMs / 60000);
+  const day = String(body?.day || dateKey());
+  const taskId =
+    body?.taskId !== undefined && body.taskId !== null && body.taskId !== ""
+      ? Number(body.taskId)
+      : t.taskId;
+  const task = taskId ? getTask(taskId) : undefined;
+  if (taskId && !task) throw new LocalError("任务不存在", 404);
+  deleteFocusTimer(userId);
+  const guard =
+    day === dateKey() && t.kind !== "game"
+      ? overworkScaleFor(userId, minutes)
+      : { scale: 1, over: false, cap: 0, todayMinutes: 0 };
+
+  const gained = { xp: 0, points: 0, prof: 0, minutes: 0 };
+  let message = "";
+
+  if (t.kind === "game") {
+    const overMinutes = Math.max(0, minutes - t.capMinutes);
+    const penalty = Math.min(30, Math.floor(overMinutes / 15) * 5);
+    if (elapsedMs > 0 && minutes <= t.capMinutes) {
+      gained.points += 2;
+      pushFocusLog({
+        userId,
+        taskId: null,
+        taskTitle: "娱乐计时",
+        category: "life",
+        mode: "game",
+        kind: "focus_control",
+        xp: 0,
+        points: 2,
+        prof: 0,
+        minutes,
+        note: `守住娱乐上限 ${t.capMinutes} 分钟，自控奖励 +2 分`,
+        day,
+      });
+      message = `守住 ${t.capMinutes} 分钟上限，获得 +2 分自控奖励。`;
+    } else if (penalty > 0) {
+      gained.points -= penalty;
+      pushFocusLog({
+        userId,
+        taskId: null,
+        taskTitle: "娱乐超时",
+        category: "life",
+        mode: "game",
+        kind: "focus_penalty",
+        xp: 0,
+        points: -penalty,
+        prof: 0,
+        minutes,
+        note: `娱乐 ${minutes} 分钟，超过 ${t.capMinutes} 分钟上限，温和扣除 ${penalty} 分`,
+        day,
+      });
+      message = `超过娱乐上限 ${t.capMinutes} 分钟共 ${overMinutes} 分钟，温和扣除 ${penalty} 分（单次封顶 30 分）。`;
+    } else {
+      message = "本次娱乐未超过上限，无扣分。";
+    }
+  } else if (task) {
+    const target = normalizeTaskTarget(task);
+    const isTimerLike = task.mode === "timer" || (task.mode === "habit" && target.metric === "blocks");
+    if (isTimerLike) {
+      const blockMs = task.blockMinutes * 60 * 1000;
+      const blocks = Math.floor(elapsedMs / blockMs);
+      if (blocks >= 1) {
+        const next =
+          task.mode === "habit" && target.metric === "blocks"
+            ? habitStreakNext(task, userId, blocks)
+            : null;
+        const r = applySettlement({
+          userId,
+          task,
+          kind: "block",
+          ratio: blocks,
+          minutes: blocks * task.blockMinutes,
+          note: `番茄钟完成 ${blocks} 个专注块${guard.over ? "（超过今日建议值，产出 20%）" : ""}`,
+          ignoreStreak: task.mode !== "habit",
+          streakOverride: next?.changed ? next.streak : undefined,
+          scale: guard.scale,
+        });
+        commitHabitStreak(task, next ?? { streak: 0, changed: false, message: "" });
+        maybeArchiveOneShot(task, userId);
+        gained.xp += r.xp;
+        gained.points += r.points;
+        gained.prof += r.prof;
+        gained.minutes += blocks * task.blockMinutes;
+        message = `已计入 ${blocks} 个专注块（${r.xp} XP）。${guard.over ? " 已超过今日建议专注时长，产出降至 20%，强烈建议休息。" : ""}`;
+      }
+      const leftoverMinutes = Math.floor((elapsedMs - blocks * blockMs) / 60000);
+      if (leftoverMinutes >= 5) {
+        const effXp = Math.round(((task.xpPerUnit * leftoverMinutes) / 60) * guard.scale);
+        const effPts = Math.round(((task.pointsPerUnit * leftoverMinutes) / 60) * guard.scale);
+        const effProf = Math.max(1, Math.round((task.profPerUnit * leftoverMinutes) / 60));
+        pushFocusLog({
+          userId,
+          taskId,
+          taskTitle: task.title,
+          category: task.category,
+          mode: task.mode,
+          kind: "focus_effort",
+          xp: effXp,
+          points: effPts,
+          prof: effProf,
+          minutes: leftoverMinutes,
+          note: `未满一个专注块的零散投入 ${leftoverMinutes} 分钟${guard.over ? "（产出 20%）" : ""}`,
+          day,
+        });
+        gained.xp += effXp;
+        gained.points += effPts;
+        gained.prof += effProf;
+        gained.minutes += leftoverMinutes;
+        message += `零散 ${leftoverMinutes} 分钟也已记入少量奖励。`;
+      }
+      if (!message) message = "本次专注未满一个完整专注块，建议再多坚持一会儿。";
+    } else {
+      const effXp = Math.round(((task.xpPerUnit * minutes) / 60) * guard.scale);
+      const effPts = Math.round(((task.pointsPerUnit * minutes) / 60) * guard.scale);
+      const effProf = Math.max(1, Math.round((task.profPerUnit * minutes) / 60));
+      pushFocusLog({
+        userId,
+        taskId,
+        taskTitle: task.title,
+        category: task.category,
+        mode: task.mode,
+        kind: "focus_effort",
+        xp: effXp,
+        points: effPts,
+        prof: effProf,
+        minutes,
+        note: `为「${task.title}」投入 ${minutes} 分钟，待手动确认进度${guard.over ? "（产出 20%）" : ""}`,
+        day,
+      });
+      gained.xp += effXp;
+      gained.points += effPts;
+      gained.prof += effProf;
+      gained.minutes += minutes;
+      message = `已记录 ${minutes} 分钟努力并给少量奖励，别忘了确认任务进度。${guard.over ? " 已超过今日建议专注时长，产出降至 20%。" : ""}`;
+    }
+  } else if (minutes >= 5) {
+    const units = Math.max(0, Math.round((minutes / 25) * guard.scale));
+    const profUnits = Math.max(1, Math.round(minutes / 25));
+    pushFocusLog({
+      userId,
+      taskId: null,
+      taskTitle: "自由专注",
+      category: "life",
+      mode: "focus",
+      kind: "focus",
+      xp: units,
+      points: units,
+      prof: profUnits,
+      minutes,
+      note: `自由专注 ${minutes} 分钟${guard.over ? "（产出 20%）" : ""}`,
+      day,
+    });
+    gained.xp += units;
+    gained.points += units;
+    gained.prof += profUnits;
+    gained.minutes += minutes;
+    message = `自由专注 ${minutes} 分钟，已记录（+${units} XP）。${guard.over ? " 已超过今日建议专注时长，产出降至 20%，强烈建议休息。" : ""}`;
+  } else {
+    message = "专注不足 5 分钟，本次仅记录不奖励。";
+  }
+
+  const after = levelFromXp(getUser(userId)!.xp);
+  const newAchievements = checkAchievements(userId);
+  await persist();
+  return {
+    ok: true,
+    gained,
+    levelUp: after > before ? { from: before, to: after, title: levelTitle(after) } : null,
+    newAchievements,
+    message,
   };
 }
 
@@ -1178,7 +1660,7 @@ export async function getStats() {
       label: `${d.getMonth() + 1}/${d.getDate()}`,
       xp: rows.reduce((a, r) => a + r.xp, 0),
       points: rows.reduce((a, r) => a + r.points, 0),
-      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+      minutes: rows.reduce((a, r) => a + focusMinutesOf(r), 0),
     });
   }
   const weekly: { week: string; label: string; minutes: number; xp: number }[] = [];
@@ -1189,7 +1671,7 @@ export async function getStats() {
     weekly.push({
       week: wk,
       label: wk.split("-W")[1] + "周",
-      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+      minutes: rows.reduce((a, r) => a + focusMinutesOf(r), 0),
       xp: rows.reduce((a, r) => a + r.xp, 0),
     });
   }
@@ -1199,7 +1681,7 @@ export async function getStats() {
     return {
       category: c,
       xp: rows.reduce((a, r) => a + r.xp, 0),
-      minutes: rows.reduce((a, r) => a + r.minutes, 0),
+      minutes: rows.reduce((a, r) => a + focusMinutesOf(r), 0),
       prof: prof[c] ?? 0,
       tier: proficiencyTier(prof[c] ?? 0).name,
     };
@@ -1300,7 +1782,7 @@ export async function getStats() {
     totals: {
       xp: all.reduce((a, r) => a + r.xp, 0),
       points: all.reduce((a, r) => a + r.points, 0),
-      minutes: all.reduce((a, r) => a + r.minutes, 0),
+      minutes: all.reduce((a, r) => a + focusMinutesOf(r), 0),
       settlements: all.filter((r) => r.xp > 0).length,
       activeDays: new Set(all.filter((r) => r.xp > 0).map((r) => r.day)).size,
     },
@@ -1626,6 +2108,820 @@ async function callProvider(baseUrl: string, apiKey: string, model: string, mess
   }
 }
 
+// ---------------- V4 复盘 / 规划 ----------------
+function journalContext(userId: number): string {
+  const tasks = listTasks(userId)
+    .filter((t) => !t.deletedAt)
+    .slice(0, 15)
+    .map((t) => {
+      const target = normalizeTaskTarget(t);
+      return {
+        title: t.title,
+        category: t.category,
+        mode: t.mode,
+        repeat: target.repeat,
+        metric: target.metric,
+        target: target.amount,
+        priority: t.priority ?? 0,
+        deadline: t.deadline || t.endDate || "",
+      };
+    });
+  const logs = allLogs(userId)
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 25)
+    .map((l) => ({ day: l.day, title: l.taskTitle, kind: l.kind, xp: l.xp, minutes: l.minutes }));
+  return JSON.stringify({ tasks, recentLogs: logs });
+}
+
+function extractJsonObject(text: string): any {
+  const t = String(text ?? "");
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("模型返回不是 JSON");
+  return JSON.parse(t.slice(start, end + 1));
+}
+
+export async function journalList() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  return doc.journals
+    .filter((j) => j.userId === userId)
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export async function journalUpsert(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const kind = body?.kind === "plan" ? "plan" : "review";
+  const period = body?.period === "weekly" ? "weekly" : "daily";
+  const periodKey = String(body?.periodKey || (period === "weekly" ? weekKey() : dateKey()));
+  const content = String(body?.content ?? "").trim();
+  if (!content) throw new LocalError("内容不能为空");
+  const existing = doc.journals.find(
+    (j) => j.userId === userId && j.kind === kind && j.periodKey === periodKey,
+  );
+  const now = Date.now();
+  let row: JournalEntry;
+  if (existing) {
+    existing.content = content;
+    existing.updatedAt = now;
+    row = existing;
+  } else {
+    row = {
+      id: nextId("journals"),
+      userId,
+      kind,
+      period,
+      periodKey,
+      content,
+      createdAt: now,
+      updatedAt: now,
+    };
+    doc.journals.push(row);
+  }
+  await persist();
+  return row;
+}
+
+export async function journalAiReview(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const row = doc.journals.find((j) => j.userId === userId && j.id === Number(body?.id));
+  if (!row) throw new LocalError("记录不存在", 404);
+  const u = getUser(userId)!;
+  const context = journalContext(userId);
+  const fallback = {
+    feedback:
+      row.content.length >= 40
+        ? "复盘内容比较具体，继续保持；把最重要的三件事和实际用时对齐，明天会更稳。"
+        : "复盘可以再具体一点：记下完成了什么、用了多久、卡在哪里，AI 才能给出更准的建议。",
+    tomorrowFocus: "先处理截止日期最近、优先级最高的 1-2 项任务，其余安排到后面。",
+    suggestedAdjustments: "如果今天有一类任务总是没做，明天把它放到精力最好的时段。",
+  };
+  if (!u.aiApiKey) {
+    row.aiFeedback = JSON.stringify({ ...fallback, source: "rule" });
+    row.updatedAt = Date.now();
+    await persist();
+    return { ...fallback, source: "rule", notice: "当前使用内置复盘模板，配置 API Key 可获得个性化复盘。" };
+  }
+  const sys =
+    "你是自律成长系统的复盘教练。根据用户写的复盘内容和系统记录，输出严格的 JSON：{feedback(2-4句中文评价), tomorrowFocus(1-2句明日安排建议), suggestedAdjustments(1-2句调整建议)}。只输出 JSON。";
+  try {
+    const apiKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
+    const data = await callProvider(u.aiBaseUrl, apiKey, u.aiModel, [
+      { role: "system", content: sys },
+      { role: "user", content: `复盘内容：${row.content}\n\n系统上下文：${context}` },
+    ]);
+    const parsed = extractJsonObject(data?.choices?.[0]?.message?.content ?? "{}");
+    const result = {
+      feedback: String(parsed.feedback ?? fallback.feedback),
+      tomorrowFocus: String(parsed.tomorrowFocus ?? fallback.tomorrowFocus),
+      suggestedAdjustments: String(parsed.suggestedAdjustments ?? fallback.suggestedAdjustments),
+      source: "ai" as const,
+    };
+    row.aiFeedback = JSON.stringify(result);
+    row.updatedAt = Date.now();
+    await persist();
+    return result;
+  } catch (e: any) {
+    const reason = e instanceof NetworkError ? CORS_HINT : String(e?.message ?? e).slice(0, 80);
+    return { ...fallback, source: "rule" as const, notice: `AI 调用失败（${reason}），已回退内置模板。` };
+  }
+}
+
+export async function planAiDecompose(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const row = doc.journals.find((j) => j.userId === userId && j.id === Number(body?.id));
+  if (!row) throw new LocalError("记录不存在", 404);
+  const u = getUser(userId)!;
+  const context = journalContext(userId);
+  const existingTitles = listTasks(userId)
+    .filter((t) => !t.deletedAt)
+    .map((t) => t.title.replace(/[，。、\s]/g, ""));
+  const fallbackTasks = String(row.content)
+    .split(/[\n；;。，,、]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 4)
+    .map((s, i) => ({
+      title: s.slice(0, 60),
+      category: i % 5 === 0 ? "academic" : i % 5 === 1 ? "language" : i % 5 === 2 ? "life" : i % 5 === 3 ? "social" : "finance",
+      mode: "timer",
+      repeat: "daily",
+      targetMetric: "blocks",
+      targetAmount: 2,
+      priority: i < 2 ? 3 : 2,
+      deadline: "",
+      difficulty: 2,
+      xpPerUnit: 20,
+      pointsPerUnit: 15,
+      profPerUnit: 15,
+      unitName: "次",
+      reason: "从规划文本拆出的下一步动作；配置 API Key 后可拆得更细、更贴合你的节奏。",
+    }))
+    .filter((t) => {
+      const title = String(t.title).replace(/[，。、\s]/g, "");
+      return title && !existingTitles.some((et) => et && (title.includes(et) || et.includes(title)));
+    })
+    .slice(0, 6);
+  const fallback = { summary: `已从规划中拆出 ${fallbackTasks.length} 个可执行任务。`, tasks: fallbackTasks };
+  if (!u.aiApiKey) {
+    row.aiPlan = JSON.stringify({ ...fallback, source: "rule" });
+    row.updatedAt = Date.now();
+    await persist();
+    return { ...fallback, source: "rule", notice: "当前使用文本拆解，配置 API Key 可获得更贴合你节奏的规划。" };
+  }
+  const sys =
+    "你是自律成长系统的规划助手。用户会提供未来规划文本和已有任务上下文。你的职责是把规划文本拆成 3-8 个新的、可立即执行的下一步任务，而不是复述已有任务。要求：1) 不要照抄或近似重复已有任务标题；2) 每个任务必须以具体动作开头（如“完成…第一步”“整理…”“准备…”），包含数量、时长或截止日等信息；3) 根据紧迫度给出 priority(0-4) 与 deadline；4) 输出严格的 JSON：{summary(一句中文总结), tasks(3-8项数组，每项含 title(中文), category('academic'|'language'|'life'|'social'|'finance'), mode('timer'|'milestone'|'habit'|'count'), repeat('none'|'daily'|'weekly'), targetMetric('checkin'|'count'|'blocks'), targetAmount(正整数), priority(0-4整数), deadline('YYYY-MM-DD'或''), difficulty(1-4), xpPerUnit, pointsPerUnit, profPerUnit, unitName(中文), reason(一句中文，说明它对应规划的哪一步))}。只输出 JSON。";
+  try {
+    const apiKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
+    const data = await callProvider(u.aiBaseUrl, apiKey, u.aiModel, [
+      { role: "system", content: sys },
+      { role: "user", content: `未来规划：${row.content}\n\n系统上下文：${context}\n\n特别注意：已有任务不要重复生成，请只输出针对这份规划的新增下一步任务。` },
+    ]);
+    const parsed = extractJsonObject(data?.choices?.[0]?.message?.content ?? "{}");
+    const tasks = Array.isArray(parsed.tasks)
+      ? parsed.tasks
+          .map((t: any, i: number) => ({
+            title: String(t?.title ?? "").slice(0, 60),
+            category: ["academic", "language", "life", "social", "finance"].includes(String(t?.category))
+              ? String(t.category)
+              : fallbackTasks[i]?.category ?? "life",
+            mode: ["timer", "milestone", "habit", "count"].includes(String(t?.mode))
+              ? String(t.mode)
+              : fallbackTasks[i]?.mode ?? "timer",
+            repeat: ["none", "daily", "weekly"].includes(String(t?.repeat))
+              ? String(t.repeat)
+              : fallbackTasks[i]?.repeat ?? "daily",
+            targetMetric: ["checkin", "count", "blocks"].includes(String(t?.targetMetric))
+              ? String(t.targetMetric)
+              : fallbackTasks[i]?.targetMetric ?? "blocks",
+            targetAmount: Number(t?.targetAmount) > 0 ? Number(t.targetAmount) : fallbackTasks[i]?.targetAmount ?? 2,
+            priority: Number(t?.priority) >= 0 && Number(t?.priority) <= 4 ? Number(t.priority) : 2,
+            deadline: String(t?.deadline ?? "").slice(0, 10),
+            difficulty: Number(t?.difficulty) >= 1 && Number(t?.difficulty) <= 4 ? Number(t.difficulty) : 2,
+            xpPerUnit: Number(t?.xpPerUnit) > 0 ? Number(t.xpPerUnit) : 20,
+            pointsPerUnit: Number(t?.pointsPerUnit) > 0 ? Number(t.pointsPerUnit) : 15,
+            profPerUnit: Number(t?.profPerUnit) > 0 ? Number(t.profPerUnit) : 15,
+            unitName: String(t?.unitName ?? "次").slice(0, 20),
+            reason: String(t?.reason ?? ""),
+          }))
+          .filter((t: any) => {
+            const title = String(t?.title ?? "").replace(/[，。、\s]/g, "");
+            return title && !existingTitles.some((et) => et && (title.includes(et) || et.includes(title)));
+          })
+          .slice(0, 8)
+      : fallbackTasks;
+    const result = {
+      summary: String(parsed.summary ?? fallback.summary),
+      tasks,
+      source: "ai" as const,
+    };
+    row.aiPlan = JSON.stringify(result);
+    row.updatedAt = Date.now();
+    await persist();
+    return result;
+  } catch (e: any) {
+    const reason = e instanceof NetworkError ? CORS_HINT : String(e?.message ?? e).slice(0, 80);
+    return { ...fallback, source: "rule" as const, notice: `AI 调用失败（${reason}），已回退文本拆解。` };
+  }
+}
+
+// ---------------- V0.4 智能规划聊天 ----------------
+function plannerSessionFor(userId: number): PlannerSession {
+  let session = doc.plannerSessions.find((s) => s.userId === userId);
+  if (!session) {
+    session = {
+      id: nextId("plannerSessions"),
+      userId,
+      messages: [],
+      askCount: 0,
+      updatedAt: Date.now(),
+    };
+    doc.plannerSessions.push(session);
+  }
+  return session;
+}
+
+function plannerContext(userId: number): string {
+  const tasks = listTasks(userId)
+    .filter((t) => !t.deletedAt)
+    .slice(0, 20)
+    .map((t) => ({
+      title: t.title,
+      category: t.category,
+      mode: t.mode,
+      deadline: t.deadline || t.endDate || "",
+      priority: t.priority ?? 0,
+    }));
+  return JSON.stringify({ today: dateKey(), existingTasks: tasks });
+}
+
+function plannerSystemPrompt(askCount: number): string {
+  return `你是自律成长系统里的任务规划顾问。用户会用自然语言描述一个目标，你要通过简短对话澄清模糊点，最终把它变成 1-8 个可执行任务。
+
+严格规则：
+1. 每次只问一个最关键的问题；如果适合让用户选择，给出 2-4 个 options。
+2. 最多问 4 个问题。当前已经问过 ${askCount} 个问题。问满 4 个后，即使信息不全，也要基于合理假设直接给计划。
+3. 当信息足够，或已经问满 4 次，输出 action="plan"。
+4. 不要重复系统中已有的任务。
+5. 始终用中文，只输出 JSON，不要输出 Markdown 或额外解释。
+
+可输出两种 JSON：
+- 继续提问：{"action":"ask","question":"一个简短问题","options":["选项A","选项B"]}
+- 给出计划：{"action":"plan","summary":"一句总结","tasks":[{...}]}
+
+task 字段：title(中文), category(academic|language|life|social|finance), mode(timer|milestone|habit|count), repeat(none|daily|weekly), targetMetric(checkin|count|blocks), targetAmount(正整数), priority(0-4整数), deadline("YYYY-MM-DD"或空字符串), difficulty(1-4), xpPerUnit(整数), pointsPerUnit(整数), profPerUnit(整数), unitName(简短中文单位), reason(一句中文说明它对应规划的哪一步)。
+
+数值建议：计时单块经验 15-60；计件按单个单位给较小值；里程碑按整个任务总量给 100-400。`;
+}
+
+function parsePlannerAction(raw: string): {
+  action: "ask" | "plan";
+  question?: string;
+  options?: string[];
+  summary?: string;
+  tasks?: unknown[];
+} {
+  const text = String(raw ?? "");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return { action: "ask", question: "请再说得具体一点，你想完成什么？", options: [] };
+  }
+  try {
+    const obj = JSON.parse(text.slice(start, end + 1));
+    const action = obj?.action === "plan" ? "plan" : "ask";
+    return {
+      action,
+      question: action === "ask" ? String(obj?.question || "请再说得具体一点。") : undefined,
+      options: Array.isArray(obj?.options) ? obj.options.map(String).slice(0, 4) : [],
+      summary: action === "plan" ? String(obj?.summary || "") : undefined,
+      tasks: action === "plan" && Array.isArray(obj?.tasks) ? obj.tasks : [],
+    };
+  } catch {
+    return { action: "ask", question: "请再说得具体一点，你想完成什么？", options: [] };
+  }
+}
+
+function normalizePlannerTasks(raw: unknown[]): InsertTask[] {
+  const out: InsertTask[] = [];
+  const existingTitles = doc.tasks
+    .filter((t) => !t.deletedAt)
+    .map((t) => t.title.replace(/[，。、\s]/g, ""));
+  for (const item of raw) {
+    const t = item as any;
+    const title = String(t?.title ?? "").trim().slice(0, 60);
+    if (!title) continue;
+    const clean = title.replace(/[，。、\s]/g, "");
+    if (existingTitles.some((et) => et && (clean.includes(et) || et.includes(clean)))) continue;
+    const category = ["academic", "language", "life", "social", "finance"].includes(String(t?.category))
+      ? (String(t.category) as InsertTask["category"])
+      : "life";
+    const mode = ["timer", "milestone", "habit", "count"].includes(String(t?.mode))
+      ? (String(t.mode) as InsertTask["mode"])
+      : "timer";
+    const repeat = ["none", "daily", "weekly"].includes(String(t?.repeat))
+      ? (String(t.repeat) as InsertTask["repeat"])
+      : mode === "habit"
+        ? "daily"
+        : mode === "timer"
+          ? "daily"
+          : "none";
+    const targetMetric = ["checkin", "count", "blocks"].includes(String(t?.targetMetric))
+      ? (String(t.targetMetric) as InsertTask["targetMetric"])
+      : mode === "timer"
+        ? "blocks"
+        : mode === "habit"
+          ? "checkin"
+          : "count";
+    const targetAmount = Number(t?.targetAmount) > 0 ? Math.round(Number(t.targetAmount)) : 1;
+    const priority = Number(t?.priority) >= 0 && Number(t?.priority) <= 4 ? Math.round(Number(t.priority)) : 2;
+    const difficulty = Number(t?.difficulty) >= 1 && Number(t?.difficulty) <= 4 ? Math.round(Number(t.difficulty)) : 2;
+    const deadline = String(t?.deadline ?? "").slice(0, 10);
+    const target = normalizeTaskTarget({ mode, repeat, targetMetric, targetAmount, unitName: t?.unitName });
+    out.push({
+      title,
+      category,
+      mode,
+      difficulty,
+      xpPerUnit: Number(t?.xpPerUnit) > 0 ? Math.round(Number(t.xpPerUnit)) : 20,
+      pointsPerUnit: Number(t?.pointsPerUnit) > 0 ? Math.round(Number(t.pointsPerUnit)) : 15,
+      profPerUnit: Number(t?.profPerUnit) > 0 ? Math.round(Number(t.profPerUnit)) : 15,
+      notes: "",
+      startDate: "",
+      endDate: deadline,
+      blockMinutes: 25,
+      dailyTargetBlocks: 2,
+      milestones: [],
+      period: repeat === "weekly" ? "weekly" : "daily",
+      targetPerPeriod: targetMetric === "checkin" ? targetAmount : 1,
+      unitName: target.unitName || "次",
+      targetCount: targetMetric === "count" ? targetAmount : 10,
+      repeat,
+      targetMetric,
+      targetAmount,
+      finishOnTarget: repeat === "none" ? 1 : 0,
+      priority,
+      deadline,
+    });
+  }
+  return out.slice(0, 8);
+}
+
+export async function plannerState() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const session = plannerSessionFor(userId);
+  return {
+    messages: session.messages,
+    askCount: session.askCount,
+    configured: !!getUser(userId)!.aiApiKey,
+  };
+}
+
+export async function plannerReset() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  doc.plannerSessions = doc.plannerSessions.filter((s) => s.userId !== userId);
+  await persist();
+  return plannerState();
+}
+
+export async function plannerSend(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const content = String(body?.content ?? "").trim();
+  if (!content) throw new LocalError("请输入你的目标");
+  const session = plannerSessionFor(userId);
+  const now = Date.now();
+  session.messages.push({ role: "user", content, createdAt: now });
+
+  if (!u.aiApiKey) {
+    const blocked: PlannerMessage = {
+      role: "assistant",
+      content: "智能规划需要先在设置页配置 AI 接口，我才能和你一步步确认需求。",
+      action: "blocked",
+      createdAt: now + 1,
+    };
+    session.messages.push(blocked);
+    session.updatedAt = now + 1;
+    await persist();
+    return { message: blocked, messages: session.messages, configured: false };
+  }
+
+  const system = plannerSystemPrompt(session.askCount);
+  const context = plannerContext(userId);
+  const history = session.messages.map((m) => ({ role: m.role, content: m.content }));
+  try {
+    const apiKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
+    const data = await callProvider(u.aiBaseUrl, apiKey, u.aiModel, [
+      { role: "system", content: `${system}\n\n当前系统上下文：${context}` },
+      ...history,
+    ]);
+    const raw = data?.choices?.[0]?.message?.content ?? "{}";
+    const parsed = parsePlannerAction(raw);
+    let message: PlannerMessage;
+    if (parsed.action === "plan") {
+      const tasks = normalizePlannerTasks(parsed.tasks ?? []);
+      message = {
+        role: "assistant",
+        content: parsed.summary || "我已经把计划整理好了。",
+        action: "plan",
+        plan: { summary: parsed.summary || "", tasks },
+        createdAt: Date.now(),
+      };
+    } else {
+      message = {
+        role: "assistant",
+        content: parsed.question || "请再说得具体一点。",
+        action: "ask",
+        question: parsed.question,
+        options: parsed.options ?? [],
+        createdAt: Date.now(),
+      };
+      session.askCount += 1;
+    }
+    session.messages.push(message);
+    session.updatedAt = Date.now();
+    await persist();
+    return { message, messages: session.messages, configured: true };
+  } catch (e: any) {
+    const reason = e instanceof NetworkError ? CORS_HINT : String(e?.message ?? e).slice(0, 100);
+    const message: PlannerMessage = {
+      role: "assistant",
+      content: `智能规划暂时不可用：${reason}`,
+      action: "blocked",
+      createdAt: Date.now(),
+    };
+    session.messages.push(message);
+    session.updatedAt = Date.now();
+    await persist();
+    return { message, messages: session.messages, configured: true };
+  }
+}
+
+export async function plannerConfirm(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const tasks = normalizePlannerTasks(Array.isArray(body?.tasks) ? body.tasks : []);
+  if (tasks.length === 0) throw new LocalError("计划中没有可创建的任务");
+  for (const task of tasks) createTaskRecord(userId, task);
+  const session = plannerSessionFor(userId);
+  session.messages.push({
+    role: "assistant",
+    content: `已创建 ${tasks.length} 个任务。`,
+    action: "done",
+    createdAt: Date.now(),
+  });
+  session.updatedAt = Date.now();
+  await persist();
+  return { ok: true, created: tasks.map((t) => t.title) };
+}
+
+// ---------------- V0.2 睡眠 ----------------
+function sleepSettingsFor(userId: number): { idealBedtime: string; idealSleepHours: number } {
+  const s = doc.sleepSettings[userId];
+  return {
+    idealBedtime: s?.idealBedtime || "23:00",
+    idealSleepHours: s?.idealSleepHours || 7.5,
+  };
+}
+
+export async function sleepState() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const settings = sleepSettingsFor(userId);
+  const records = doc.sleepLogs
+    .filter((l) => l.userId === userId)
+    .slice()
+    .sort((a, b) => a.day.localeCompare(b.day) || a.createdAt - b.createdAt);
+  return { settings, records: records.slice(-14) };
+}
+
+export async function sleepSettingsUpdate(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const bedtime = String(body?.idealBedtime || "23:00");
+  if (Number.isNaN(timeToMinutes(bedtime))) throw new LocalError("理想入睡时间格式不正确");
+  const hours = Math.max(4, Math.min(12, Number(body?.idealSleepHours) || 7.5));
+  doc.sleepSettings[userId] = { idealBedtime: bedtime, idealSleepHours: hours };
+  await persist();
+  return { settings: doc.sleepSettings[userId] };
+}
+
+export async function sleepRecord(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const day = String(body?.day || dateKey());
+  const sleepTime = String(body?.sleepTime || "");
+  const wakeTime = String(body?.wakeTime || "");
+  const settings = sleepSettingsFor(userId);
+  const score = sleepScore({
+    sleepTime,
+    wakeTime,
+    idealBedtime: settings.idealBedtime,
+    idealSleepHours: settings.idealSleepHours,
+  });
+  if (score.minutes <= 0) throw new LocalError(score.reason);
+  const existing = doc.sleepLogs.find((l) => l.userId === userId && l.day === day);
+  const now = Date.now();
+  if (existing) {
+    const dx = score.xp - existing.xp;
+    const dp = score.points - existing.points;
+    const dpr = score.prof - existing.prof;
+    if (dx !== 0 || dp !== 0 || dpr !== 0) {
+      pushFocusLog({
+        userId,
+        taskId: null,
+        taskTitle: "睡眠调整",
+        category: "life",
+        mode: "sleep",
+        kind: "sleep_adjust",
+        xp: dx,
+        points: dp,
+        prof: dpr,
+        minutes: Math.max(0, score.minutes - existing.durationMinutes),
+        note: `更新 ${day} 睡眠记录`,
+        day,
+      });
+    }
+    existing.sleepTime = sleepTime;
+    existing.wakeTime = wakeTime;
+    existing.durationMinutes = score.minutes;
+    existing.xp = score.xp;
+    existing.points = score.points;
+    existing.prof = score.prof;
+    existing.updatedAt = now;
+  } else {
+    pushFocusLog({
+      userId,
+      taskId: null,
+      taskTitle: "睡眠记录",
+      category: "life",
+      mode: "sleep",
+      kind: "sleep",
+      xp: score.xp,
+      points: score.points,
+      prof: score.prof,
+      minutes: score.minutes,
+      note: `${day} 睡眠 ${(score.minutes / 60).toFixed(1)} 小时`,
+      day,
+    });
+    doc.sleepLogs.push({
+      id: nextId("sleepLogs"),
+      userId,
+      day,
+      sleepTime,
+      wakeTime,
+      durationMinutes: score.minutes,
+      xp: score.xp,
+      points: score.points,
+      prof: score.prof,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  await persist();
+  const record = existing ?? doc.sleepLogs.find((l) => l.userId === userId && l.day === day);
+  return { ok: true, score, record };
+}
+
+// ---------------- V0.3 开销记账 ----------------
+function findBudgetTask(userId: number): Task | undefined {
+  return doc.tasks.find(
+    (t) =>
+      t.userId === userId &&
+      !t.deletedAt &&
+      t.archived !== 1 &&
+      t.category === "finance" &&
+      normalizeTaskTarget(t).repeat === "daily" &&
+      (t.dailyBudgetCents != null ||
+        normalizeTaskTarget(t).metric === "count" ||
+        /预算|开销|支出/.test(t.title)),
+  );
+}
+
+function budgetCentsOf(t: Task): number | null {
+  if (t.dailyBudgetCents != null) return t.dailyBudgetCents;
+  if (normalizeTaskTarget(t).metric === "count") return normalizeTaskTarget(t).amount * 100;
+  return null;
+}
+
+function expenseStateData(userId: number) {
+  const today = dateKey();
+  const rows = doc.expenses
+    .filter((e) => e.userId === userId)
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt);
+  const todayRows = rows.filter((e) => e.day === today);
+  const totalCents = todayRows.reduce((a, e) => a + e.amountCents, 0);
+  const budgetTask = findBudgetTask(userId);
+  const budgetCents = budgetTask ? budgetCentsOf(budgetTask) : null;
+  const byCategory = (["food", "life", "fun", "study"] as const).map((key) => ({
+    key,
+    totalCents: todayRows.filter((e) => e.category === key).reduce((a, e) => a + e.amountCents, 0),
+  }));
+  return {
+    today: {
+      day: today,
+      totalCents,
+      budgetCents,
+      met: budgetCents != null && totalCents <= budgetCents,
+    },
+    budgetTask: budgetTask ? taskView(userId, budgetTask) : null,
+    recent: rows.slice(0, 20),
+    byCategory,
+  };
+}
+
+function createBudgetTask(userId: number, budgetCents: number): Task {
+  const budgetYuan = Math.max(1, Math.round(budgetCents / 100));
+  const data: InsertTask = {
+    title: `每日开销控制在 ${budgetYuan} 元`,
+    category: "finance",
+    mode: "habit",
+    difficulty: 2,
+    xpPerUnit: 10,
+    pointsPerUnit: 8,
+    profPerUnit: 6,
+    notes: "V0.3 自动生成的每日预算任务，可在开销页或任务页修改金额与奖励。",
+    startDate: "",
+    endDate: "",
+    blockMinutes: 25,
+    dailyTargetBlocks: 1,
+    milestones: [],
+    period: "daily",
+    targetPerPeriod: 1,
+    unitName: "次",
+    targetCount: 1,
+    repeat: "daily",
+    targetMetric: "checkin",
+    targetAmount: 1,
+    finishOnTarget: 0,
+    priority: 2,
+    deadline: "",
+    dailyBudgetCents: budgetCents,
+  };
+  return createTaskRecord(userId, data);
+}
+
+export async function expenseState() {
+  await ensureLoaded();
+  return expenseStateData(requireUserId());
+}
+
+export async function expenseAdd(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const day = String(body?.day || dateKey());
+  const category: "food" | "life" | "fun" | "study" = ["food", "life", "fun", "study"].includes(
+    String(body?.category),
+  )
+    ? (String(body.category) as "food" | "life" | "fun" | "study")
+    : "life";
+  const amount = Number(body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new LocalError("请输入有效金额");
+  const cents = Math.round(amount * 100);
+  const note = String(body?.note ?? "").slice(0, 100);
+  doc.expenses.push({
+    id: nextId("expenses"),
+    userId,
+    day,
+    category,
+    amountCents: cents,
+    note,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  let budgetTask = findBudgetTask(userId);
+  let autoCreated = false;
+  if (!budgetTask) {
+    budgetTask = createBudgetTask(userId, 100 * 100);
+    autoCreated = true;
+  }
+  const budgetCents = budgetCentsOf(budgetTask!);
+  const total = doc.expenses
+    .filter((e) => e.userId === userId && e.day === day)
+    .reduce((a, e) => a + e.amountCents, 0);
+  let message = "";
+  if (budgetCents != null) {
+    if (total <= budgetCents) {
+      if (budgetTask!.mode === "habit") {
+        const already = periodCheckins(budgetTask!) >= budgetTask!.targetPerPeriod;
+        if (!already) {
+          await checkin(budgetTask!.id, { percent: 100 });
+          message = `今日开销 ${(total / 100).toFixed(2)} 元，预算任务已完成。`;
+        }
+      } else {
+        const already = doc.logs.some(
+          (l) => l.userId === userId && l.taskId === budgetTask!.id && l.day === day && l.kind === "budget_met",
+        );
+        if (!already) {
+          pushFocusLog({
+            userId,
+            taskId: budgetTask!.id,
+            taskTitle: budgetTask!.title,
+            category: "finance",
+            mode: budgetTask!.mode,
+            kind: "budget_met",
+            xp: budgetTask!.xpPerUnit,
+            points: budgetTask!.pointsPerUnit,
+            prof: budgetTask!.profPerUnit,
+            minutes: 0,
+            note: `当日开销达标（${(total / 100).toFixed(2)}/${(budgetCents / 100).toFixed(2)} 元）`,
+            day,
+          });
+          message = `今日开销 ${(total / 100).toFixed(2)} 元，预算任务已完成。`;
+        }
+      }
+    } else {
+      message = `今日开销 ${(total / 100).toFixed(2)} 元，已超出预算 ${((total - budgetCents) / 100).toFixed(2)} 元（不扣分）。`;
+    }
+  }
+  if (autoCreated) message = `${message ? message + " " : ""}已自动创建每日预算任务（100 元/天），可随时修改。`;
+  await persist();
+  return { ok: true, message, state: expenseStateData(userId) };
+}
+
+export async function expenseBudget(body: any) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const amount = Number(body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new LocalError("请输入有效金额");
+  const cents = Math.round(amount * 100);
+  const existing = findBudgetTask(userId);
+  if (existing) {
+    existing.dailyBudgetCents = cents;
+    if (normalizeTaskTarget(existing).metric === "count") {
+      existing.targetAmount = Math.max(1, Math.round(cents / 100));
+    }
+  } else {
+    createBudgetTask(userId, cents);
+  }
+  await persist();
+  return { ok: true, state: expenseStateData(userId) };
+}
+
+export async function expenseDelete(id: number) {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const idx = doc.expenses.findIndex((e) => e.userId === userId && e.id === id);
+  if (idx < 0) throw new LocalError("记录不存在", 404);
+  doc.expenses.splice(idx, 1);
+  await persist();
+  return { ok: true, state: expenseStateData(userId) };
+}
+
+// ---------------- V0.3.1 睡眠健康工作闸门 ----------------
+function previousNightSleepMinutes(userId: number): number {
+  const key = dateKey(new Date(Date.now() - 86400000));
+  return doc.sleepLogs.find((l) => l.userId === userId && l.day === key)?.durationMinutes ?? 0;
+}
+
+function focusMinutesToday(userId: number): number {
+  const today = dateKey();
+  return allLogs(userId)
+    .filter(
+      (l) =>
+        l.userId === userId &&
+        l.day === today &&
+        ["block", "manual", "focus", "focus_effort"].includes(l.kind),
+    )
+    .reduce((a, l) => a + Math.max(0, l.minutes), 0);
+}
+
+function overworkScaleFor(
+  userId: number,
+  extraMinutes: number,
+): { scale: number; over: boolean; cap: number; todayMinutes: number } {
+  const cap = recommendedWorkMinutes(previousNightSleepMinutes(userId));
+  const todayMinutes = focusMinutesToday(userId) + extraMinutes;
+  return { scale: todayMinutes > cap ? OVERWORK_MULT : 1, over: todayMinutes > cap, cap, todayMinutes };
+}
+
+function overworkStatus(userId: number) {
+  const sleepMinutes = previousNightSleepMinutes(userId);
+  const cap = recommendedWorkMinutes(sleepMinutes);
+  const todayMinutes = focusMinutesToday(userId);
+  return {
+    sleepMinutes,
+    cap,
+    todayMinutes,
+    over: todayMinutes > cap,
+    reason: workLimitReason(sleepMinutes, todayMinutes, cap),
+  };
+}
+
+export async function focusLimits() {
+  await ensureLoaded();
+  return overworkStatus(requireUserId());
+}
+
 export async function aiTest(body: any) {
   await ensureLoaded();
   const userId = requireUserId();
@@ -1650,13 +2946,25 @@ export async function aiSuggest(body: any) {
   const userId = requireUserId();
   const { title = "", category = "academic", mode = "timer", goal = "" } = body ?? {};
   const fallback = ruleSuggest(String(category), String(mode));
+  const targetFallback = ruleTargetFor(String(category), String(mode));
+  const ruleResult = {
+    ...fallback,
+    category: String(category),
+    mode: String(mode),
+    repeat: targetFallback.repeat,
+    targetMetric: targetFallback.metric,
+    targetAmount: targetFallback.amount,
+    unitName: targetFallback.unitName,
+    finishOnTarget: false,
+    source: "rule" as const,
+  };
   const u = getUser(userId)!;
   if (!u.aiApiKey) {
-    return { ...fallback, source: "rule", notice: "当前使用内置规则，配置 API Key 可获得个性化深度规划。" };
+    return { ...ruleResult, notice: "当前使用内置规则，配置 API Key 可获得个性化深度规划。" };
   }
   const sys =
-    "你是一个自律管理系统的规划助手。根据用户任务信息，输出严格的 JSON，字段：blockMinutes(整数分钟), dailyTargetBlocks(整数), period('daily'|'weekly'), targetPerPeriod(整数), difficulty(1-4整数), xpPerUnit(整数), pointsPerUnit(整数), profPerUnit(整数), milestones(中文字符串数组，3-6项), reason(一句中文理由)。数值需符合：计时模式单块经验 15-60；计件模式按单个单位给较小值；里程碑模式为整个任务总量给较大值(100-400)。只输出 JSON。";
-  const userMsg = `任务标题：${title}\n类别：${categoryName(String(category))}\n结算模式：${mode}\n用户目标描述：${goal || "（未填写）"}`;
+    "你是一个自律管理系统的规划助手。请根据用户的目标描述，不只调数值，还要推荐任务的类别、结算模式与达标口径。输出严格的 JSON，字段：category('academic'|'language'|'life'|'social'|'finance'), mode('timer'|'milestone'|'habit'|'count'), repeat('none'|'daily'|'weekly'), targetMetric('checkin'|'count'|'blocks'), targetAmount(正整数), finishOnTarget(true|false，仅一次性总目标建议 true), blockMinutes(整数分钟), dailyTargetBlocks(整数), period('daily'|'weekly'), targetPerPeriod(整数), targetCount(整数), unitName(简短中文单位), difficulty(1-4整数), xpPerUnit(整数), pointsPerUnit(整数), profPerUnit(整数), milestones(中文字符串数组，3-6项), reason(一句中文理由，说明为什么选这个形态)。数值需符合：计时模式单块经验 15-60；计件模式按单个单位给较小值；里程碑模式为整个任务总量给较大值(100-400)。如果用户提到每日/每周重复，优先 repeat 为 daily/weekly；如果提到时间投入，优先 timer+blocks；如果提到数量，优先 count。只输出 JSON。";
+  const userMsg = `任务标题：${title || "（未命名）"}\n用户当前类别：${categoryName(String(category))}\n当前结算模式：${modeName(String(mode))}\n用户目标描述：${goal || "（未填写）"}\n请据此推荐 category、mode、repeat、targetMetric 等完整形态。`;
   try {
     const apiKey = await decryptSecretValue(u.aiApiKey, doc.appSecret);
     const data = await callProvider(u.aiBaseUrl, apiKey, u.aiModel, [
@@ -1665,13 +2973,23 @@ export async function aiSuggest(body: any) {
     ]);
     const content = data?.choices?.[0]?.message?.content ?? "{}";
     const parsed = JSON.parse(content);
+    const okCategory = ["academic", "language", "life", "social", "finance"].includes(String(parsed.category));
+    const okMode = ["timer", "milestone", "habit", "count"].includes(String(parsed.mode));
+    const okRepeat = ["none", "daily", "weekly"].includes(String(parsed.repeat));
+    const okMetric = ["checkin", "count", "blocks"].includes(String(parsed.targetMetric));
     return {
+      category: okCategory ? String(parsed.category) : ruleResult.category,
+      mode: okMode ? String(parsed.mode) : ruleResult.mode,
+      repeat: okRepeat ? (parsed.repeat as "none" | "daily" | "weekly") : ruleResult.repeat,
+      targetMetric: okMetric ? (parsed.targetMetric as "checkin" | "count" | "blocks") : ruleResult.targetMetric,
+      targetAmount: Number(parsed.targetAmount) > 0 ? Number(parsed.targetAmount) : ruleResult.targetAmount,
+      finishOnTarget: parsed.finishOnTarget === true,
       blockMinutes: Number(parsed.blockMinutes) || fallback.blockMinutes,
       dailyTargetBlocks: Number(parsed.dailyTargetBlocks) || fallback.dailyTargetBlocks,
       period: parsed.period === "weekly" ? "weekly" : fallback.period ?? "daily",
       targetPerPeriod: Number(parsed.targetPerPeriod) || fallback.targetPerPeriod,
       targetCount: Number(parsed.targetCount) || fallback.targetCount,
-      unitName: parsed.unitName || fallback.unitName,
+      unitName: parsed.unitName || fallback.unitName || ruleResult.unitName,
       difficulty: Number(parsed.difficulty) || 2,
       xpPerUnit: Number(parsed.xpPerUnit) || fallback.xpPerUnit,
       pointsPerUnit: Number(parsed.pointsPerUnit) || fallback.pointsPerUnit,
@@ -1682,7 +3000,7 @@ export async function aiSuggest(body: any) {
     };
   } catch (e: any) {
     const reason = e instanceof NetworkError ? CORS_HINT : String(e?.message ?? e).slice(0, 80);
-    return { ...fallback, source: "rule", notice: `AI 调用失败（${reason}），已回退内置规则。` };
+    return { ...ruleResult, notice: `AI 调用失败（${reason}），已回退内置规则。` };
   }
 }
 
@@ -1930,7 +3248,7 @@ function findUpkeepDay(userId: number, day: string): UpkeepDay | undefined {
 function upkeepDayMetrics(userId: number, day: string, category: string) {
   const rows = doc.logs.filter((l) => l.userId === userId && l.day === day && l.category === category);
   return {
-    minutes: rows.reduce((a, r) => a + Math.max(0, r.minutes), 0),
+    minutes: rows.reduce((a, r) => a + focusMinutesOf(r), 0),
     proficiency: rows.reduce((a, r) => a + Math.max(0, r.prof), 0),
     count: rows.filter((r) => r.xp > 0).length,
   };
@@ -2641,7 +3959,11 @@ function profileToCloud(userId: number, cloudId: string) {
     // 只同步 base_url / model —— AI API Key 绝不上云
     ai_config: { base_url: u.aiBaseUrl, model: u.aiModel },
     upkeep_config: getUpkeepConfig(userId),
-    settings: { pendingExemptions: pend, createdAt: u.createdAt },
+    settings: {
+      pendingExemptions: pend,
+      createdAt: u.createdAt,
+      sleep: doc.sleepSettings[userId] ?? null,
+    },
     timezone: getUpkeepConfig(userId).timezone,
     last_backup_at: toIso(doc.lastBackupAt[String(userId)] ?? null),
   };
@@ -2657,6 +3979,13 @@ function profileFromCloud(userId: number, row: any) {
   if (typeof ai.model === "string" && ai.model) u.aiModel = ai.model;
   if (row.upkeep_config && Object.keys(row.upkeep_config).length) {
     writeUpkeepConfig(userId, normalizeUpkeepConfig(row.upkeep_config));
+  }
+  const sleepCfg = (row.settings ?? {}).sleep;
+  if (sleepCfg && typeof sleepCfg.idealBedtime === "string" && sleepCfg.idealBedtime) {
+    doc.sleepSettings[userId] = {
+      idealBedtime: sleepCfg.idealBedtime,
+      idealSleepHours: Number(sleepCfg.idealSleepHours) || 7.5,
+    };
   }
   const pend = (row.settings ?? {}).pendingExemptions;
   if (Array.isArray(pend)) {
@@ -2959,6 +4288,153 @@ export async function attachCloudSession(input: {
   const token = await createSession(user.id, input.remember !== false);
   await persist();
   return { user: await publicUser(user.id), token };
+}
+
+/** V0.5：把当前本地账号连接到 GitHub 私有同步仓库（不创建新的镜像账号） */
+export async function githubConnectCurrent(input: {
+  token: string;
+  repo: string;
+  cloudUserId: string;
+  login: string;
+}): Promise<{ user: any; token: string }> {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const repo = String(input.repo ?? "").trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
+  if (!repo.includes("/")) throw new LocalError("同步仓库格式应为 owner/repo");
+  u.cloudUserId = String(input.cloudUserId);
+  u.email = String(input.login || input.cloudUserId);
+  u.username = u.username || String(input.login || input.cloudUserId);
+  u.githubToken = await encryptSecretValue(String(input.token ?? ""), doc.appSecret);
+  u.githubRepo = repo;
+  backfillUids(userId);
+  await persist();
+  const s = getSession(authToken);
+  return { user: await publicUser(userId), token: s?.token ?? "" };
+}
+
+/** V0.5：断开当前账号的 GitHub 同步，恢复纯本地模式 */
+export async function githubDisconnectCurrent() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const cloudId = u.cloudUserId ?? null;
+  if (cloudId) {
+    doc.outbox = doc.outbox.filter((e) => e.cloudUserId !== cloudId);
+    for (const t of CLOUD_TABLES) {
+      delete doc.cursors[`${cloudId}:${t}`];
+      if (doc.pushed[t]) doc.pushed[t] = {};
+    }
+  }
+  u.cloudUserId = null;
+  u.email = "";
+  u.githubToken = "";
+  u.githubRepo = "";
+  await persist();
+  return { ok: true, user: await publicUser(userId) };
+}
+
+/** V0.5：当前会话对应的 GitHub 用户 id，用于启动时恢复登录 */
+export async function githubCurrentUser(): Promise<{ id: string; email: string } | null> {
+  await ensureLoaded();
+  const cloudId = activeCloudUserId();
+  if (!cloudId || !cloudId.startsWith("github:")) return null;
+  const localId = activeLocalUserId();
+  if (localId == null) return null;
+  return { id: cloudId, email: getUser(localId)?.email || cloudId };
+}
+
+/** V0.6：把当前本地账号连接到自托管在线后端 */
+export async function serverConnectCurrent(input: {
+  serverUrl: string;
+  token: string;
+  cloudUserId: string;
+  email: string;
+}): Promise<{ user: any; token: string }> {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  u.cloudUserId = String(input.cloudUserId);
+  u.email = String(input.email || input.cloudUserId);
+  u.username = u.username || String(input.email || input.cloudUserId);
+  u.serverUrl = String(input.serverUrl ?? "").trim();
+  u.serverToken = await encryptSecretValue(String(input.token ?? ""), doc.appSecret);
+  u.githubToken = "";
+  u.githubRepo = "";
+  backfillUids(userId);
+  await persist();
+  const s = getSession(authToken);
+  return { user: await publicUser(userId), token: s?.token ?? "" };
+}
+
+/** V0.6：当前会话对应的在线后端用户 id，用于启动时恢复登录 */
+export async function serverCurrentUser(): Promise<{ id: string; email: string } | null> {
+  await ensureLoaded();
+  const cloudId = activeCloudUserId();
+  if (!cloudId || cloudId.startsWith("github:")) return null;
+  const localId = activeLocalUserId();
+  if (localId == null) return null;
+  return { id: cloudId, email: getUser(localId)?.email || cloudId };
+}
+
+/** V0.6：读取当前账号的在线后端连接信息 */
+export async function serverConnection(userId: number): Promise<{ baseUrl: string; token: string }> {
+  await ensureLoaded();
+  const u = getUser(userId);
+  if (!u) return { baseUrl: "", token: "" };
+  return {
+    baseUrl: u.serverUrl || "",
+    token: await decryptSecretValue(u.serverToken ?? "", doc.appSecret),
+  };
+}
+
+/** V0.6：断开当前账号的在线后端连接 */
+export async function serverDisconnectCurrent() {
+  await ensureLoaded();
+  const userId = requireUserId();
+  const u = getUser(userId)!;
+  const cloudId = u.cloudUserId ?? null;
+  if (cloudId) {
+    doc.outbox = doc.outbox.filter((e) => e.cloudUserId !== cloudId);
+    for (const t of CLOUD_TABLES) {
+      delete doc.cursors[`${cloudId}:${t}`];
+      if (doc.pushed[t]) doc.pushed[t] = {};
+    }
+  }
+  u.cloudUserId = null;
+  u.email = "";
+  u.serverUrl = "";
+  u.serverToken = "";
+  await persist();
+  return { ok: true, user: await publicUser(userId) };
+}
+
+/** V0.5：读取当前账号的 GitHub 连接信息（token 在内存中解密） */
+export async function githubConnection(userId: number): Promise<{ token: string; repo: string }> {
+  await ensureLoaded();
+  const u = getUser(userId);
+  if (!u) return { token: "", repo: "" };
+  return {
+    token: await decryptSecretValue(u.githubToken ?? "", doc.appSecret),
+    repo: u.githubRepo ?? "",
+  };
+}
+
+/** V0.5：把当前账号的全部可同步行序列化成单个快照，供 GitHub 文件后端使用 */
+export function buildCloudSnapshot(userId: number, cloudId: string): Record<CloudTable, any[]> {
+  const out = {} as Record<CloudTable, any[]>;
+  for (const table of CLOUD_TABLES) out[table] = [];
+  for (const row of enumerateRows(userId, cloudId)) {
+    const built = buildPushRow(row.table, row.pk, userId, cloudId);
+    if (built) out[row.table].push(built);
+  }
+  return out;
+}
+
+/** V0.5：GitHub 快照上传成功后，清空该账号的全部 outbox */
+export function markAllPushed(userId: number, cloudId: string) {
+  const entries = enumerateRows(userId, cloudId).map((r) => ({ table: r.table, pk: r.pk }));
+  markPushed(userId, cloudId, entries);
 }
 
 /** 本地模式账号列表（可迁移到云端的候选） */

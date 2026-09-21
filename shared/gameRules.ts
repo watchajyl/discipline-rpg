@@ -40,6 +40,114 @@ export function modeName(key: string): string {
   return MODES.find((m) => m.key === key)?.name ?? key;
 }
 
+// ---------- V3 灵活任务目标 ----------
+export type RepeatMode = "none" | "daily" | "weekly";
+export type TargetMetric = "checkin" | "count" | "blocks";
+
+export const REPEAT_OPTIONS: { key: RepeatMode; name: string; desc: string }[] = [
+  { key: "none", name: "一次性总目标", desc: "累计达成目标，按设置决定是否结束" },
+  { key: "daily", name: "每日", desc: "每天重置目标，适合每天重复的投入" },
+  { key: "weekly", name: "每周", desc: "每周重置目标，适合周度任务" },
+];
+
+export const TARGET_METRIC_OPTIONS: { key: TargetMetric; name: string; desc: string; unit: string }[] = [
+  { key: "checkin", name: "打卡次数", desc: "每次完成都算一次打卡", unit: "次" },
+  { key: "count", name: "完成数量", desc: "按完成数量计件，例如 100 个单词", unit: "个" },
+  { key: "blocks", name: "专注块", desc: "按专注块结算时长，例如每天 2 个 25 分钟块", unit: "块" },
+];
+
+export function repeatName(key: string): string {
+  return REPEAT_OPTIONS.find((r) => r.key === key)?.name ?? key;
+}
+
+export function metricName(key: string): string {
+  return TARGET_METRIC_OPTIONS.find((m) => m.key === key)?.name ?? key;
+}
+
+export function metricUnit(key: string): string {
+  return TARGET_METRIC_OPTIONS.find((m) => m.key === key)?.unit ?? "次";
+}
+
+type TargetShapeSource = {
+  mode?: string;
+  period?: string;
+  targetPerPeriod?: number;
+  dailyTargetBlocks?: number;
+  targetCount?: number;
+  repeat?: RepeatMode | string;
+  targetMetric?: TargetMetric | string;
+  targetAmount?: number;
+  unitName?: string;
+};
+
+/** 把新旧任务字段统一成 V3 目标形态；旧数据按原模式语义推断，行为不变 */
+export function normalizeTaskTarget(t: TargetShapeSource): {
+  repeat: RepeatMode;
+  metric: TargetMetric;
+  amount: number;
+  unitName: string;
+} {
+  const mode = t.mode ?? "timer";
+  const repeat: RepeatMode =
+    (t.repeat as RepeatMode) ??
+    (mode === "habit"
+      ? (t.period as RepeatMode) === "weekly"
+        ? "weekly"
+        : "daily"
+      : mode === "timer"
+        ? "daily"
+        : "none");
+  const metric: TargetMetric =
+    (t.targetMetric as TargetMetric) ??
+    (mode === "habit" ? "checkin" : mode === "timer" ? "blocks" : "count");
+  const amount =
+    t.targetAmount ??
+    (mode === "timer"
+      ? t.dailyTargetBlocks
+      : mode === "habit"
+        ? t.targetPerPeriod
+        : t.targetCount) ??
+    1;
+  const unitName =
+    t.unitName ?? (metric === "blocks" ? "块" : metric === "count" ? "个" : "次");
+  return { repeat, metric, amount: Math.max(1, Math.round(amount)), unitName };
+}
+
+/** 内置规则给出的 V3 目标起点（配合 RULE_DEFAULTS 使用） */
+export function ruleTargetFor(category: string, mode: string): {
+  repeat: RepeatMode;
+  metric: TargetMetric;
+  amount: number;
+  unitName: string;
+} {
+  const base = RULE_DEFAULTS[`${category}_${mode}`] ?? {};
+  if (mode === "habit") {
+    return {
+      repeat: (base.period as RepeatMode) ?? "daily",
+      metric: "checkin",
+      amount: base.targetPerPeriod ?? 1,
+      unitName: "次",
+    };
+  }
+  if (mode === "timer") {
+    return {
+      repeat: "daily",
+      metric: "blocks",
+      amount: base.dailyTargetBlocks ?? 2,
+      unitName: "块",
+    };
+  }
+  if (mode === "count") {
+    return {
+      repeat: "none",
+      metric: "count",
+      amount: base.targetCount ?? 10,
+      unitName: base.unitName ?? "个",
+    };
+  }
+  return { repeat: "none", metric: "checkin", amount: 1, unitName: "次" };
+}
+
 // ---------- 难度系数 ----------
 export const DIFFICULTIES: { value: number; name: string; mul: number }[] = [
   { value: 1, name: "轻松", mul: 0.8 },
@@ -233,6 +341,7 @@ export type SettleInput = {
   streak?: number;        // habit 模式
   effects?: UnlockedEffects;
   crossCategoryToday?: boolean;
+  urgencyMul?: number;    // 截止日前完成的一次性加成
 };
 
 export type SettleResult = { xp: number; points: number; prof: number; streakMul: number };
@@ -250,11 +359,23 @@ export function computeSettlement(input: SettleInput): SettleResult {
   const profMul = eff?.profBoost ? 1.12 : 1;
 
   return {
-    xp: Math.round(input.xpPerUnit * diff * streakMul * input.ratio * xpMul),
+    xp: Math.round(input.xpPerUnit * diff * streakMul * input.ratio * xpMul * (input.urgencyMul ?? 1)),
     points: Math.round(input.pointsPerUnit * diff * streakMul * input.ratio * ptsMul),
     prof: Math.round(input.profPerUnit * diff * input.ratio * profMul),
     streakMul,
   };
+}
+
+/** V4：截止日紧迫加成。完成时离 deadline ≤7 天加 15%，≤3 天且高优先级加 30%。过期不加不扣。 */
+export function urgencyMultiplier(endDate: string | undefined, priority: number | undefined, day: string): number {
+  if (!endDate) return 1;
+  const end = new Date(endDate + "T23:59:59").getTime();
+  const cur = new Date(day + "T12:00:00").getTime();
+  if (!Number.isFinite(end) || !Number.isFinite(cur)) return 1;
+  const daysLeft = Math.round((end - cur) / 86400000);
+  if (daysLeft < 0 || daysLeft > 7) return 1;
+  if (daysLeft <= 3 && (priority ?? 0) >= 3) return 1.3;
+  return 1.15;
 }
 
 // ---------- 内置规则引擎（无 API Key 时的建议） ----------

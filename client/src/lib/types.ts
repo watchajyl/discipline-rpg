@@ -7,6 +7,8 @@ export type TaskFull = Omit<Task, "milestones"> & {
   todayBlocks: number;
   todayXp: number;
   timer: { running: boolean; elapsedMs: number; startedAt: number; accumulatedMs: number } | null;
+  /** V3：按任务目标口径计算的当前进度 */
+  targetProgress: { current: number; target: number; label: string };
 };
 
 export type Profile = {
@@ -141,12 +143,20 @@ export type UpkeepData = {
 };
 
 export type Suggestion = {
+  category?: string;
+  mode?: string;
   blockMinutes?: number;
   dailyTargetBlocks?: number;
   period?: "daily" | "weekly";
   targetPerPeriod?: number;
   targetCount?: number;
   unitName?: string;
+  repeat?: "none" | "daily" | "weekly";
+  targetMetric?: "checkin" | "count" | "blocks";
+  targetAmount?: number;
+  finishOnTarget?: boolean;
+  priority?: number;
+  deadline?: string;
   difficulty: number;
   xpPerUnit: number;
   pointsPerUnit: number;

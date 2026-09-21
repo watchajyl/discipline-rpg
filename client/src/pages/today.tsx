@@ -9,6 +9,9 @@ import { TaskCard } from "@/components/task-card";
 import { TaskFormSheet } from "@/components/task-form";
 import { MigrationHintCard } from "@/components/sync-settings";
 import { UpkeepCard } from "@/components/upkeep-card";
+import { FocusTimer } from "@/components/focus-timer";
+import { SleepCard } from "@/components/sleep-card";
+import { WorkGuardBanner } from "@/components/work-guard";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -119,6 +122,15 @@ export default function TodayPage() {
 
       {/* 今日维持（V2） */}
       <UpkeepCard />
+
+      {/* 全局专注计时器（V3 / 番茄钟） */}
+      <FocusTimer />
+
+      {/* 睡眠健康工作闸门（V0.3.1） */}
+      <WorkGuardBanner />
+
+      {/* 睡眠打卡（V0.2） */}
+      <SleepCard />
 
       {/* 备份提醒 */}
       {profile?.backup?.due && !backupHidden && (

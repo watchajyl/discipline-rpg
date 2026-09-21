@@ -19,6 +19,8 @@ export type SessionUser = {
   aiBaseUrl: string;
   aiModel: string;
   aiKeyMasked: string;
+  githubConfigured?: boolean;
+  githubRepo?: string;
   securityQuestion?: string;
   cloudUserId?: string | null;
   email?: string;
@@ -210,6 +212,11 @@ export function invalidateAll(userId: number) {
     "/api/rewards",
     "/api/redemptions",
     "/api/upkeep",
+    "/api/journals",
+    "/api/focus/state",
+    "/api/focus/limits",
+    "/api/sleep/state",
+    "/api/expenses/state",
   ]) {
     queryClient.invalidateQueries({ queryKey: [key, userId] });
   }

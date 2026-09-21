@@ -120,6 +120,49 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/api\/import$/, handler: ({ body }) => db.importData(body?.payload ?? body) },
   { method: "POST", pattern: /^\/api\/clear-data$/, handler: () => db.clearData() },
 
+  // ---------------- V3 全局专注计时器 ----------------
+  { method: "GET", pattern: /^\/api\/focus\/state(?:\/(\d+))?$/, handler: () => db.focusState() },
+  { method: "GET", pattern: /^\/api\/focus\/limits(?:\/(\d+))?$/, handler: () => db.focusLimits() },
+  { method: "POST", pattern: /^\/api\/focus\/start$/, handler: ({ body }) => db.focusStart(body) },
+  { method: "POST", pattern: /^\/api\/focus\/pause$/, handler: () => db.focusPause() },
+  { method: "POST", pattern: /^\/api\/focus\/abandon$/, handler: () => db.focusAbandon() },
+  { method: "POST", pattern: /^\/api\/focus\/stop$/, handler: ({ body }) => db.focusStop(body) },
+
+  // ---------------- V4 复盘 / 规划 ----------------
+  { method: "GET", pattern: /^\/api\/journals(?:\/(\d+))?$/, handler: () => db.journalList() },
+  { method: "POST", pattern: /^\/api\/journals$/, handler: ({ body }) => db.journalUpsert(body) },
+  {
+    method: "POST",
+    pattern: /^\/api\/journals\/(\d+)\/ai-review$/,
+    handler: ({ params }) => db.journalAiReview({ id: params[0] }),
+  },
+  {
+    method: "POST",
+    pattern: /^\/api\/journals\/(\d+)\/ai-decompose$/,
+    handler: ({ params }) => db.planAiDecompose({ id: params[0] }),
+  },
+
+  // ---------------- V0.2 睡眠 ----------------
+  { method: "GET", pattern: /^\/api\/sleep\/state(?:\/(\d+))?$/, handler: () => db.sleepState() },
+  { method: "PATCH", pattern: /^\/api\/sleep\/settings$/, handler: ({ body }) => db.sleepSettingsUpdate(body) },
+  { method: "POST", pattern: /^\/api\/sleep\/record$/, handler: ({ body }) => db.sleepRecord(body) },
+
+  // ---------------- V0.3 开销记账 ----------------
+  { method: "GET", pattern: /^\/api\/expenses\/state(?:\/(\d+))?$/, handler: () => db.expenseState() },
+  { method: "POST", pattern: /^\/api\/expenses$/, handler: ({ body }) => db.expenseAdd(body) },
+  { method: "PATCH", pattern: /^\/api\/expenses\/budget$/, handler: ({ body }) => db.expenseBudget(body) },
+  {
+    method: "DELETE",
+    pattern: /^\/api\/expenses\/(\d+)$/,
+    handler: ({ params }) => db.expenseDelete(num(params[0])),
+  },
+
+  // ---------------- V0.4 智能规划聊天 ----------------
+  { method: "GET", pattern: /^\/api\/planner\/state(?:\/(\d+))?$/, handler: () => db.plannerState() },
+  { method: "POST", pattern: /^\/api\/planner\/reset$/, handler: () => db.plannerReset() },
+  { method: "POST", pattern: /^\/api\/planner\/send$/, handler: ({ body }) => db.plannerSend(body) },
+  { method: "POST", pattern: /^\/api\/planner\/confirm$/, handler: ({ body }) => db.plannerConfirm(body) },
+
   // ---------------- AI ----------------
   { method: "POST", pattern: /^\/api\/ai\/test$/, handler: ({ body }) => db.aiTest(body) },
   { method: "POST", pattern: /^\/api\/ai\/suggest$/, handler: ({ body }) => db.aiSuggest(body) },

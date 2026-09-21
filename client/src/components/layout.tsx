@@ -8,6 +8,10 @@ import {
   Gift,
   BarChart3,
   Settings as SettingsIcon,
+  ClipboardList,
+  CalendarDays,
+  Wallet,
+  MessageSquareText,
   Menu,
   X,
   Moon,
@@ -31,6 +35,10 @@ const NAV = [
   { href: "/skill-tree", label: "成长树", icon: Network },
   { href: "/rewards", label: "积分商城", icon: Gift },
   { href: "/stats", label: "数据统计", icon: BarChart3 },
+  { href: "/schedule", label: "日程表", icon: CalendarDays },
+  { href: "/planner", label: "智能规划", icon: MessageSquareText },
+  { href: "/plans", label: "复盘规划", icon: ClipboardList },
+  { href: "/money", label: "开销记账", icon: Wallet },
   { href: "/settings", label: "设置", icon: SettingsIcon },
 ];
 

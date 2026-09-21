@@ -7,26 +7,20 @@
 //   · outbox 按 (table, pk) 去重，只追加表用 insert-if-absent，重复补传不会重复计分
 //   · 断网时 push/pull 直接跳过，恢复联网后自动补传
 // ============================================================
-import { supabase } from "./supabase";
 import type { CloudTable } from "./cloud-map";
+import { serverGetSnapshot, serverPutSnapshot, ServerError } from "./server-api";
 import {
   activeUserIds,
-  buildPushRow,
+  buildCloudSnapshot,
   cloudTables,
-  conflictKey,
-  cursorColumn,
-  getCursor,
-  isAppendOnly,
   lastSyncAt as readLastSyncAt,
-  markPushFailed,
-  markPushed,
+  markAllPushed,
   mergeCloudRows,
   outboxCount,
-  outboxEntries,
   persistNow,
   recordMergedHashes,
   reprojectUser,
-  setCursor,
+  serverConnection,
   setLastSyncAt,
 } from "./localdb";
 
@@ -104,20 +98,6 @@ export interface SyncResult {
   errors: string[];
 }
 
-const PUSH_ORDER: CloudTable[] = [
-  "profiles",
-  "tasks",
-  "rewards",
-  "settlement_logs",
-  "redemptions",
-  "achievements_unlocked",
-  "skill_nodes_unlocked",
-  "upkeep_days",
-];
-
-const BATCH = 200;
-const PAGE = 500;
-
 function errText(e: any): string {
   return String(e?.message ?? e?.error_description ?? e ?? "未知错误");
 }
@@ -144,83 +124,49 @@ async function runSync(): Promise<SyncResult | null> {
   }
   emit({ state: "syncing", online: true, pending: outboxCount(cloudId), message: "" });
 
-  const sb = supabase();
-  const { data: sess } = await sb.auth.getSession();
-  if (!sess.session || sess.session.user.id !== cloudId) {
-    // session 掉了：保持离线队列，等用户重新登录
-    emit({ state: "error", message: "登录状态已过期，请重新登录", pending: outboxCount(cloudId) });
-    return { pushed: 0, pulled: 0, pending: outboxCount(cloudId), errors: ["session 失效"] };
-  }
-
   const errors: string[] = [];
   let pushed = 0;
   let pulled = 0;
 
-  // ---------- 1. push ----------
-  const entries = outboxEntries(cloudId);
-  for (const table of PUSH_ORDER) {
-    const mine = entries.filter((e) => e.table === table);
-    if (mine.length === 0) continue;
-    for (let i = 0; i < mine.length; i += BATCH) {
-      const chunk = mine.slice(i, i + BATCH);
-      const rows: any[] = [];
-      const ok: { table: CloudTable; pk: string }[] = [];
-      for (const e of chunk) {
-        const row = buildPushRow(table, e.pk, localId, cloudId);
-        if (row) {
-          rows.push(row);
-          ok.push({ table, pk: e.pk });
-        } else {
-          // 本地行已不存在（例如硬删的计时器行）：直接出队，避免卡住队列
-          ok.push({ table, pk: e.pk });
-        }
+  const { baseUrl, token } = await serverConnection(localId);
+  if (!baseUrl || !token) {
+    emit({ state: "error", message: "尚未配置在线服务器", pending: outboxCount(cloudId) });
+    return { pushed: 0, pulled: 0, pending: outboxCount(cloudId), errors: ["未配置在线服务器"] };
+  }
+
+  // 拉取远程快照并合并；上传时用 sha 做乐观并发，冲突则重试。
+  let succeeded = false;
+  for (let attempt = 0; attempt < 3 && !succeeded; attempt++) {
+    try {
+      const remote = await serverGetSnapshot(baseUrl, token);
+      const remoteTables = remote?.data?.tables ?? {};
+      for (const table of cloudTables()) {
+        pulled += mergeCloudRows(localId, table, remoteTables[table] ?? []);
       }
-      if (rows.length > 0) {
-        const { error } = await sb
-          .from(table)
-          .upsert(rows, { onConflict: conflictKey(table), ignoreDuplicates: isAppendOnly(table) });
-        if (error) {
-          markPushFailed(cloudId, table, errText(error));
-          errors.push(`${table}: ${errText(error)}`);
-          continue;
-        }
+      const snapshot = {
+        version: 1,
+        updatedAt: Date.now(),
+        tables: buildCloudSnapshot(localId, cloudId),
+      };
+      await serverPutSnapshot(baseUrl, token, Number(remote.version ?? 0), snapshot);
+      pushed += 1;
+      markAllPushed(localId, cloudId);
+      succeeded = true;
+    } catch (e: any) {
+      if (e instanceof ServerError && e.status === 409) {
+        continue;
       }
-      markPushed(localId, cloudId, ok);
-      pushed += rows.length;
+      errors.push(errText(e));
+      break;
     }
   }
 
-  // ---------- 2. pull ----------
-  for (const table of cloudTables()) {
-    const col = cursorColumn(table);
-    let cursor = getCursor(cloudId, table);
-    for (let guard = 0; guard < 40; guard++) {
-      const { data, error } = await sb
-        .from(table)
-        .select("*")
-        .eq("user_id", cloudId)
-        .gt(col, cursor)
-        .order(col, { ascending: true })
-        .limit(PAGE);
-      if (error) {
-        errors.push(`${table}: ${errText(error)}`);
-        break;
-      }
-      const rows = data ?? [];
-      if (rows.length === 0) break;
-      pulled += mergeCloudRows(localId, table, rows);
-      const last = rows[rows.length - 1] as any;
-      const next = last?.[col];
-      if (!next || next === cursor) break;
-      cursor = next;
-      setCursor(cloudId, table, next);
-      if (rows.length < PAGE) break;
-    }
+  if (succeeded) {
+    recordMergedHashes(localId, cloudId);
   }
 
   // ---------- 3. 重算 + 落盘 ----------
   if (pulled > 0) reprojectUser(localId);
-  recordMergedHashes(localId, cloudId);
   const now = Date.now();
   if (errors.length === 0) setLastSyncAt(cloudId, now);
   await persistNow();

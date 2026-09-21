@@ -16,6 +16,10 @@ import SkillTreePage from "@/pages/skill-tree";
 import RewardsPage from "@/pages/rewards";
 import StatsPage from "@/pages/stats";
 import SettingsPage from "@/pages/settings";
+import PlansPage from "@/pages/plans";
+import MoneyPage from "@/pages/money";
+import SchedulePage from "@/pages/schedule";
+import PlannerPage from "@/pages/planner";
 
 function AppRouter() {
   return (
@@ -26,6 +30,10 @@ function AppRouter() {
       <Route path="/skill-tree" component={SkillTreePage} />
       <Route path="/rewards" component={RewardsPage} />
       <Route path="/stats" component={StatsPage} />
+      <Route path="/plans" component={PlansPage} />
+      <Route path="/planner" component={PlannerPage} />
+      <Route path="/money" component={MoneyPage} />
+      <Route path="/schedule" component={SchedulePage} />
       <Route path="/settings" component={SettingsPage} />
       <Route component={NotFound} />
     </Switch>

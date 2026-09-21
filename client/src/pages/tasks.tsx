@@ -58,12 +58,19 @@ export default function TasksPage() {
   });
 
   const filtered = useMemo(() => {
-    return (tasks ?? []).filter((t) => {
+    const list = (tasks ?? []).filter((t) => {
       if (showArchived ? t.archived !== 1 : t.archived === 1) return false;
       if (cat !== "all" && t.category !== cat) return false;
       if (mode !== "all" && t.mode !== mode) return false;
       if (q && !t.title.toLowerCase().includes(q.toLowerCase()) && !t.notes.includes(q)) return false;
       return true;
+    });
+    return list.sort((a, b) => {
+      const pri = (b.priority ?? 0) - (a.priority ?? 0);
+      if (pri !== 0) return pri;
+      const da = a.deadline || a.endDate || "9999-12-31";
+      const db = b.deadline || b.endDate || "9999-12-31";
+      return da.localeCompare(db);
     });
   }, [tasks, q, cat, mode, showArchived]);
 

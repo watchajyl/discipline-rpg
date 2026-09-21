@@ -87,6 +87,16 @@ export function TaskCard({
                 已归档
               </Badge>
             )}
+            {(task.priority ?? 0) >= 3 && task.archived !== 1 && (
+              <Badge variant={(task.priority ?? 0) >= 4 ? "destructive" : "default"} className="text-[11px]">
+                {(task.priority ?? 0) === 4 ? "最高优先级" : "高优先级"}
+              </Badge>
+            )}
+            {task.deadline && task.archived !== 1 && (
+              <span className="text-[11px] text-muted-foreground">
+                截止 <span className="num">{task.deadline}</span>
+              </span>
+            )}
           </div>
         </div>
         {onEdit && (
@@ -120,10 +130,14 @@ export function TaskCard({
       </div>
 
       <div className="mt-3.5 border-t border-border/70 pt-3.5">
-        {task.mode === "timer" && <TimerControls task={task} settle={settle} />}
+        {(task.mode === "timer" || (task.mode === "habit" && task.targetMetric === "blocks")) && (
+          <TimerControls task={task} settle={settle} />
+        )}
         {task.mode === "milestone" && <MilestoneControls task={task} settle={settle} />}
-        {task.mode === "habit" && <HabitControls task={task} settle={settle} />}
-        {task.mode === "count" && <CountControls task={task} settle={settle} />}
+        {task.mode === "habit" && task.targetMetric === "checkin" && <HabitControls task={task} settle={settle} />}
+        {(task.mode === "count" || (task.mode === "habit" && task.targetMetric === "count")) && (
+          <CountControls task={task} settle={settle} />
+        )}
       </div>
     </div>
   );
@@ -199,8 +213,9 @@ function TimerControls({ task, settle }: { task: TaskFull; settle: any }) {
           </span>
         </div>
         <span className="text-[11px] text-muted-foreground">
-          今日 <Num className="text-foreground">{task.todayBlocks}</Num>/
-          <Num>{task.dailyTargetBlocks}</Num> 块
+          {task.repeat === "none" ? "累计" : task.repeat === "weekly" ? "本周" : "今日"}{" "}
+          <Num className="text-foreground">{task.targetProgress.current}</Num>/
+          <Num>{task.targetProgress.target}</Num> 块
         </span>
       </div>
 
@@ -475,13 +490,15 @@ function HabitControls({ task, settle }: { task: TaskFull; settle: any }) {
 // ---------------- 计件 ----------------
 function CountControls({ task, settle }: { task: TaskFull; settle: any }) {
   const [custom, setCustom] = useState("5");
-  const ratio = Math.min(1, task.currentCount / task.targetCount);
+  const { current, target } = task.targetProgress;
+  const ratio = Math.min(1, current / target);
+  const periodLabel = task.repeat === "none" ? "已完成" : task.repeat === "weekly" ? "本周" : "今日";
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
         <span>
-          已完成 <Num className="text-base font-bold text-foreground">{task.currentCount}</Num> /{" "}
-          <Num>{task.targetCount}</Num> {task.unitName}
+          {periodLabel} <Num className="text-base font-bold text-foreground">{current}</Num> /{" "}
+          <Num>{target}</Num> {task.unitName}
         </span>
         <span>
           单个 <Num className="text-foreground">{task.xpPerUnit}</Num> XP
@@ -489,9 +506,11 @@ function CountControls({ task, settle }: { task: TaskFull; settle: any }) {
       </div>
       <Bar ratio={ratio} color={catColor(task.category)} height={6} />
       <p className="text-[11px] text-muted-foreground">
-        {task.currentCount >= task.targetCount
-          ? "目标已达成，收官奖励已发放，可继续累积。"
-          : `距离目标还差 ${task.targetCount - task.currentCount} ${task.unitName}，达成再加 20% 收官奖励。`}
+        {current >= target
+          ? task.repeat === "none"
+            ? "目标已达成，收官奖励已发放，可继续累积。"
+            : "本期目标已达成，下个周期会重新计算。"
+          : `距离目标还差 ${target - current} ${task.unitName}${task.repeat === "none" ? "，达成再加 20% 收官奖励。" : "。"}`}
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <Button

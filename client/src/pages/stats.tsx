@@ -343,7 +343,9 @@ export default function StatsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(logs ?? []).map((l) => (
+                    {(logs ?? []).map((l) => {
+                      const isFocus = ["block", "manual", "focus", "focus_effort"].includes(l.kind);
+                      return (
                       <tr key={l.id} className="border-b border-border/50" data-testid={`row-log-${l.id}`}>
                         <td className="num py-1.5 pr-2 whitespace-nowrap text-muted-foreground">{l.day.slice(5)}</td>
                         <td className="max-w-[10rem] truncate py-1.5 pr-2">{l.taskTitle}</td>
@@ -352,9 +354,10 @@ export default function StatsPage() {
                         </td>
                         <td className="num py-1.5 pr-2 text-right">{l.xp > 0 ? `+${l.xp}` : l.xp}</td>
                         <td className="num py-1.5 pr-2 text-right">{l.points > 0 ? `+${l.points}` : l.points}</td>
-                        <td className="num py-1.5 text-right text-muted-foreground">{l.minutes || "—"}</td>
+                        <td className="num py-1.5 text-right text-muted-foreground">{isFocus && l.minutes ? l.minutes : "—"}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

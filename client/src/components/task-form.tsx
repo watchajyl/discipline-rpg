@@ -11,7 +11,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
 import { Badge } from "@/components/ui/badge";
 import { Sparkles, Plus, Trash2, Wand2, Loader2 } from "lucide-react";
-import { CATEGORIES, MODES, DIFFICULTIES, categoryName, ruleSuggest } from "@shared/gameRules";
+import {
+  CATEGORIES,
+  MODES,
+  DIFFICULTIES,
+  REPEAT_OPTIONS,
+  TARGET_METRIC_OPTIONS,
+  categoryName,
+  modeName,
+  metricName,
+  normalizeTaskTarget,
+  repeatName,
+  ruleSuggest,
+  ruleTargetFor,
+} from "@shared/gameRules";
 import type { TaskFull, Suggestion } from "@/lib/types";
 import { Num } from "./bits";
 
@@ -33,10 +46,17 @@ type FormState = {
   targetPerPeriod: number;
   unitName: string;
   targetCount: number;
+  repeat: "none" | "daily" | "weekly";
+  targetMetric: "checkin" | "count" | "blocks";
+  targetAmount: number;
+  finishOnTarget: 0 | 1;
+  priority: number;
 };
 
 function initial(task?: TaskFull | null): FormState {
   if (task) {
+    const target = normalizeTaskTarget(task);
+    const period = task.period === "weekly" || target.repeat === "weekly" ? "weekly" : "daily";
     return {
       title: task.title,
       category: task.category,
@@ -51,13 +71,19 @@ function initial(task?: TaskFull | null): FormState {
       blockMinutes: task.blockMinutes,
       dailyTargetBlocks: task.dailyTargetBlocks,
       milestones: task.milestones,
-      period: task.period as "daily" | "weekly",
+      period,
       targetPerPeriod: task.targetPerPeriod,
       unitName: task.unitName,
       targetCount: task.targetCount,
+      repeat: target.repeat,
+      targetMetric: target.metric,
+      targetAmount: target.amount,
+      finishOnTarget: task.finishOnTarget ? 1 : 0,
+      priority: task.priority ?? 0,
     };
   }
   const r = ruleSuggest("academic", "timer");
+  const target = ruleTargetFor("academic", "timer");
   return {
     title: "",
     category: "academic",
@@ -76,6 +102,11 @@ function initial(task?: TaskFull | null): FormState {
     targetPerPeriod: 1,
     unitName: "次",
     targetCount: 10,
+    repeat: target.repeat,
+    targetMetric: target.metric,
+    targetAmount: target.amount,
+    finishOnTarget: 0,
+    priority: 0,
   };
 }
 
@@ -107,6 +138,50 @@ export function TaskFormSheet({
     setForm((f) => ({ ...f, [key]: value }));
   }
 
+  function changeCategory(v: string) {
+    const rule = ruleSuggest(v, form.mode);
+    const target = ruleTargetFor(v, form.mode);
+    setForm((f) => ({
+      ...f,
+      category: v,
+      xpPerUnit: rule.xpPerUnit,
+      pointsPerUnit: rule.pointsPerUnit,
+      profPerUnit: rule.profPerUnit,
+      unitName: rule.unitName ?? f.unitName,
+      targetCount: rule.targetCount ?? f.targetCount,
+      targetPerPeriod: rule.targetPerPeriod ?? f.targetPerPeriod,
+      blockMinutes: rule.blockMinutes ?? f.blockMinutes,
+      dailyTargetBlocks: rule.dailyTargetBlocks ?? f.dailyTargetBlocks,
+      repeat: target.repeat,
+      targetMetric: target.metric,
+      targetAmount: target.amount,
+    }));
+  }
+
+  function changeMode(v: string) {
+    const rule = ruleSuggest(form.category, v);
+    const target = ruleTargetFor(form.category, v);
+    setForm((f) => ({
+      ...f,
+      mode: v,
+      difficulty: 2,
+      xpPerUnit: rule.xpPerUnit,
+      pointsPerUnit: rule.pointsPerUnit,
+      profPerUnit: rule.profPerUnit,
+      blockMinutes: rule.blockMinutes ?? 25,
+      dailyTargetBlocks: rule.dailyTargetBlocks ?? 2,
+      period: (rule.period as "daily" | "weekly") ?? "daily",
+      targetPerPeriod: rule.targetPerPeriod ?? 1,
+      unitName: rule.unitName ?? "次",
+      targetCount: rule.targetCount ?? 10,
+      repeat: target.repeat,
+      targetMetric: target.metric,
+      targetAmount: target.amount,
+      finishOnTarget: 0,
+      milestones: [],
+    }));
+  }
+
   const suggest = useMutation({
     mutationFn: async () => {
       const res = await apiRequest("POST", "/api/ai/suggest", {
@@ -126,8 +201,20 @@ export function TaskFormSheet({
 
   const save = useMutation({
     mutationFn: async () => {
+      const target = normalizeTaskTarget({ ...form, mode: form.mode });
       const payload = {
         ...form,
+        repeat: target.repeat,
+        targetMetric: target.metric,
+        targetAmount: target.amount,
+        finishOnTarget: form.finishOnTarget ? 1 : 0,
+        priority: form.priority ?? 0,
+        deadline: form.endDate || "",
+        dailyTargetBlocks: target.metric === "blocks" ? target.amount : form.dailyTargetBlocks,
+        period: form.mode === "habit" ? target.repeat : form.period,
+        targetPerPeriod: form.mode === "habit" && target.metric === "checkin" ? target.amount : form.targetPerPeriod,
+        targetCount: form.mode === "count" ? target.amount : form.targetCount,
+        blockMinutes: form.blockMinutes || 25,
         milestones: form.milestones.map((m, i) => ({
           id: m.id || `m${i + 1}`,
           title: m.title,
@@ -154,30 +241,89 @@ export function TaskFormSheet({
       }),
   });
 
+  function adopt(key: string, value: any) {
+    if (key === "category") {
+      if (!task) changeCategory(value);
+      return;
+    }
+    if (key === "mode") {
+      if (!task) changeMode(value);
+      return;
+    }
+    set(key as keyof FormState, value);
+  }
+
   function applyAll() {
     if (!suggestion) return;
+    let next = { ...form };
+    if (!task && suggestion.category) next = { ...next, category: suggestion.category };
+    if (!task && suggestion.mode && suggestion.mode !== next.mode) {
+      const rule = ruleSuggest(next.category, suggestion.mode);
+      const target = ruleTargetFor(next.category, suggestion.mode);
+      next = {
+        ...next,
+        mode: suggestion.mode,
+        difficulty: 2,
+        xpPerUnit: rule.xpPerUnit,
+        pointsPerUnit: rule.pointsPerUnit,
+        profPerUnit: rule.profPerUnit,
+        blockMinutes: rule.blockMinutes ?? 25,
+        dailyTargetBlocks: rule.dailyTargetBlocks ?? 2,
+        period: (rule.period as "daily" | "weekly") ?? "daily",
+        targetPerPeriod: rule.targetPerPeriod ?? 1,
+        unitName: rule.unitName ?? "次",
+        targetCount: rule.targetCount ?? 10,
+        repeat: target.repeat,
+        targetMetric: target.metric,
+        targetAmount: target.amount,
+        finishOnTarget: 0,
+        milestones: [],
+      };
+    }
     setForm((f) => ({
-      ...f,
-      difficulty: suggestion.difficulty ?? f.difficulty,
-      xpPerUnit: suggestion.xpPerUnit ?? f.xpPerUnit,
-      pointsPerUnit: suggestion.pointsPerUnit ?? f.pointsPerUnit,
-      profPerUnit: suggestion.profPerUnit ?? f.profPerUnit,
-      blockMinutes: suggestion.blockMinutes ?? f.blockMinutes,
-      dailyTargetBlocks: suggestion.dailyTargetBlocks ?? f.dailyTargetBlocks,
-      period: (suggestion.period as any) ?? f.period,
-      targetPerPeriod: suggestion.targetPerPeriod ?? f.targetPerPeriod,
-      targetCount: suggestion.targetCount ?? f.targetCount,
-      unitName: suggestion.unitName ?? f.unitName,
+      ...next,
+      difficulty: suggestion.difficulty ?? next.difficulty,
+      xpPerUnit: suggestion.xpPerUnit ?? next.xpPerUnit,
+      pointsPerUnit: suggestion.pointsPerUnit ?? next.pointsPerUnit,
+      profPerUnit: suggestion.profPerUnit ?? next.profPerUnit,
+      blockMinutes: suggestion.blockMinutes ?? next.blockMinutes,
+      dailyTargetBlocks: suggestion.dailyTargetBlocks ?? next.dailyTargetBlocks,
+      period: (suggestion.period as any) ?? next.period,
+      targetPerPeriod: suggestion.targetPerPeriod ?? next.targetPerPeriod,
+      targetCount: suggestion.targetCount ?? next.targetCount,
+      unitName: suggestion.unitName ?? next.unitName,
+      repeat: (suggestion.repeat as any) ?? next.repeat,
+      targetMetric: (suggestion.targetMetric as any) ?? next.targetMetric,
+      targetAmount: suggestion.targetAmount ?? next.targetAmount,
+      finishOnTarget: suggestion.finishOnTarget === true ? 1 : suggestion.finishOnTarget === false ? 0 : next.finishOnTarget,
+      priority: suggestion.priority ?? next.priority,
       milestones:
-        f.mode === "milestone" && suggestion.milestones?.length
+        next.mode === "milestone" && suggestion.milestones?.length
           ? suggestion.milestones.map((t, i) => ({ id: `m${i + 1}`, title: t, weight: 1, done: false }))
-          : f.milestones,
+          : next.milestones,
     }));
     toast({ title: "已全部采纳", description: "所有字段仍可继续手改。" });
   }
 
-  const fieldRows: { label: string; key: keyof FormState; value?: number | string }[] = suggestion
+  const fieldRows: { label: string; key: string; value?: number | string }[] = suggestion
     ? [
+        ...(!task && suggestion.category
+          ? [{ label: "推荐类别", key: "category", value: categoryName(suggestion.category) }]
+          : []),
+        ...(!task && suggestion.mode
+          ? [{ label: "推荐模式", key: "mode", value: modeName(suggestion.mode) }]
+          : []),
+        ...(suggestion.repeat ? [{ label: "目标周期", key: "repeat", value: repeatName(suggestion.repeat) }] : []),
+        ...(suggestion.targetMetric ? [{ label: "达标口径", key: "targetMetric", value: metricName(suggestion.targetMetric) }] : []),
+        ...(suggestion.targetAmount !== undefined
+          ? [{ label: "目标量", key: "targetAmount", value: suggestion.targetAmount }]
+          : []),
+        ...(suggestion.finishOnTarget !== undefined
+          ? [{ label: "达成后", key: "finishOnTarget", value: suggestion.finishOnTarget ? "完成并归档" : "继续累计" }]
+          : []),
+        ...(suggestion.priority !== undefined
+          ? [{ label: "优先级", key: "priority", value: suggestion.priority }]
+          : []),
         { label: "难度", key: "difficulty", value: suggestion.difficulty },
         { label: "单份经验", key: "xpPerUnit", value: suggestion.xpPerUnit },
         { label: "单份积分", key: "pointsPerUnit", value: suggestion.pointsPerUnit },
@@ -209,7 +355,7 @@ export function TaskFormSheet({
         <SheetHeader>
           <SheetTitle className="text-xl">{task ? "编辑任务" : "新建任务"}</SheetTitle>
           <SheetDescription className="leading-relaxed">
-            先选类别与结算模式，再用 AI 建议给出参数起点，所有数值都可以手改。
+            描述你的目标，AI 会连类别、模式与达标口径一起推荐；也可以先手选再让 AI 调参数，所有字段都能继续手改。
           </SheetDescription>
         </SheetHeader>
 
@@ -228,7 +374,7 @@ export function TaskFormSheet({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="space-y-1.5">
               <Label>类别</Label>
-              <Select value={form.category} onValueChange={(v) => set("category", v)}>
+              <Select value={form.category} onValueChange={changeCategory}>
                 <SelectTrigger data-testid="select-task-category">
                   <SelectValue />
                 </SelectTrigger>
@@ -243,7 +389,7 @@ export function TaskFormSheet({
             </div>
             <div className="space-y-1.5">
               <Label>结算模式</Label>
-              <Select value={form.mode} onValueChange={(v) => set("mode", v)} disabled={!!task}>
+              <Select value={form.mode} onValueChange={changeMode} disabled={!!task}>
                 <SelectTrigger data-testid="select-task-mode">
                   <SelectValue />
                 </SelectTrigger>
@@ -268,12 +414,12 @@ export function TaskFormSheet({
               <div className="min-w-0">
                 <p className="flex items-center gap-1.5 text-sm font-semibold">
                   <Sparkles className="h-4 w-4 text-primary" />
-                  AI 参数建议
+                  AI 规划建议
                 </p>
                 <p className="mt-1 text-[11px] text-muted-foreground leading-relaxed">
                   {user?.aiConfigured
-                    ? "已配置 API Key，将调用你的模型生成个性化规划。"
-                    : "当前使用内置规则，配置 API Key 可获得个性化深度规划。"}
+                    ? "已配置 API Key，将推荐类别、模式、口径与数值。"
+                    : "当前使用内置规则，配置 API Key 可获得个性化完整规划。"}
                 </p>
               </div>
               <Button
@@ -294,7 +440,7 @@ export function TaskFormSheet({
             </div>
             <Textarea
               className="mt-2.5 min-h-[64px]"
-              placeholder="简要描述你的目标，例如：三个月内完成第三章并投出去"
+              placeholder="用一句话描述目标：做什么、多频繁、要多久。例如：每周读完一篇论文并整理卡片"
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               data-testid="input-ai-goal"
@@ -313,19 +459,17 @@ export function TaskFormSheet({
                 <ul className="space-y-1">
                   {fieldRows.map((r) => (
                     <li
-                      key={String(r.key)}
+                      key={r.key}
                       className="flex items-center justify-between gap-2 rounded-md bg-background/70 px-2 py-1.5"
                     >
                       <span className="text-xs text-muted-foreground">{r.label}</span>
                       <span className="flex items-center gap-2">
-                        <Num className="text-xs font-semibold">
-                          {r.key === "period" ? (r.value === "weekly" ? "每周" : "每日") : String(r.value)}
-                        </Num>
+                        <Num className="text-xs font-semibold">{String(r.value)}</Num>
                         <Button
                           size="sm"
                           variant="ghost"
                           className="h-6 px-2 text-[11px]"
-                          onClick={() => set(r.key, r.value as any)}
+                          onClick={() => adopt(r.key, r.value)}
                           data-testid={`button-adopt-${String(r.key)}`}
                         >
                           采纳
@@ -373,43 +517,137 @@ export function TaskFormSheet({
 
           {/* 模式专属字段 */}
           {form.mode === "timer" && (
-            <div className="grid grid-cols-2 gap-3">
-              <NumField label="专注块分钟" value={form.blockMinutes} onChange={(v) => set("blockMinutes", v)} testId="input-block-minutes" />
-              <NumField label="每日目标块数" value={form.dailyTargetBlocks} onChange={(v) => set("dailyTargetBlocks", v)} testId="input-daily-blocks" />
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label>目标周期</Label>
+                  <Select value={form.repeat} onValueChange={(v) => set("repeat", v as any)}>
+                    <SelectTrigger data-testid="select-timer-repeat">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {REPEAT_OPTIONS.map((r) => (
+                        <SelectItem key={r.key} value={r.key}>
+                          {r.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <NumField label="专注块分钟" value={form.blockMinutes} onChange={(v) => set("blockMinutes", v)} testId="input-block-minutes" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <NumField
+                  label={form.repeat === "none" ? "总目标块数" : form.repeat === "weekly" ? "每周目标块数" : "每日目标块数"}
+                  value={form.targetAmount}
+                  onChange={(v) => set("targetAmount", v)}
+                  testId="input-target-amount"
+                />
+                {form.repeat === "none" && (
+                  <FinishSelect value={form.finishOnTarget} onChange={(v) => set("finishOnTarget", v)} testId="select-timer-finish" />
+                )}
+              </div>
             </div>
           )}
 
           {form.mode === "habit" && (
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label>打卡周期</Label>
-                <Select value={form.period} onValueChange={(v) => set("period", v as any)}>
-                  <SelectTrigger data-testid="select-period">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="daily">每日</SelectItem>
-                    <SelectItem value="weekly">每周</SelectItem>
-                  </SelectContent>
-                </Select>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label>打卡周期</Label>
+                  <Select value={form.repeat} onValueChange={(v) => set("repeat", v as any)}>
+                    <SelectTrigger data-testid="select-period">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="daily">每日</SelectItem>
+                      <SelectItem value="weekly">每周</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <Label>检验方式</Label>
+                  <Select value={form.targetMetric} onValueChange={(v) => set("targetMetric", v as any)}>
+                    <SelectTrigger data-testid="select-habit-metric">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TARGET_METRIC_OPTIONS.map((m) => (
+                        <SelectItem key={m.key} value={m.key}>
+                          {m.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
-              <NumField label="每周期次数" value={form.targetPerPeriod} onChange={(v) => set("targetPerPeriod", v)} testId="input-target-per-period" />
+              {form.targetMetric === "checkin" && (
+                <NumField label="每周期次数" value={form.targetAmount} onChange={(v) => set("targetAmount", v)} testId="input-target-per-period" />
+              )}
+              {form.targetMetric === "count" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <NumField label="每周期目标数量" value={form.targetAmount} onChange={(v) => set("targetAmount", v)} testId="input-target-amount" />
+                  <div className="space-y-1.5">
+                    <Label htmlFor="unit-name">单位名称</Label>
+                    <Input
+                      id="unit-name"
+                      value={form.unitName}
+                      onChange={(e) => set("unitName", e.target.value)}
+                      placeholder="个单词 / 份简历"
+                      data-testid="input-unit-name"
+                    />
+                  </div>
+                </div>
+              )}
+              {form.targetMetric === "blocks" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <NumField label="专注块分钟" value={form.blockMinutes} onChange={(v) => set("blockMinutes", v)} testId="input-block-minutes" />
+                  <NumField label="每周期目标块数" value={form.targetAmount} onChange={(v) => set("targetAmount", v)} testId="input-target-amount" />
+                </div>
+              )}
             </div>
           )}
 
           {form.mode === "count" && (
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label htmlFor="unit-name">单位名称</Label>
-                <Input
-                  id="unit-name"
-                  value={form.unitName}
-                  onChange={(e) => set("unitName", e.target.value)}
-                  placeholder="个单词 / 份简历"
-                  data-testid="input-unit-name"
-                />
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label>目标周期</Label>
+                  <Select value={form.repeat} onValueChange={(v) => set("repeat", v as any)}>
+                    <SelectTrigger data-testid="select-count-repeat">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {REPEAT_OPTIONS.map((r) => (
+                        <SelectItem key={r.key} value={r.key}>
+                          {r.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="unit-name-count">单位名称</Label>
+                  <Input
+                    id="unit-name-count"
+                    value={form.unitName}
+                    onChange={(e) => set("unitName", e.target.value)}
+                    placeholder="个单词 / 份简历"
+                    data-testid="input-unit-name"
+                  />
+                </div>
               </div>
-              <NumField label="目标数量" value={form.targetCount} onChange={(v) => set("targetCount", v)} testId="input-target-count" />
+              <div className="grid grid-cols-2 gap-3">
+                <NumField
+                  label={form.repeat === "none" ? "总目标数量" : form.repeat === "weekly" ? "每周目标数量" : "每日目标数量"}
+                  value={form.targetAmount}
+                  onChange={(v) => set("targetAmount", v)}
+                  testId="input-target-count"
+                />
+                {form.repeat === "none" && (
+                  <FinishSelect value={form.finishOnTarget} onChange={(v) => set("finishOnTarget", v)} testId="select-count-finish" />
+                )}
+              </div>
             </div>
           )}
 
@@ -478,20 +716,37 @@ export function TaskFormSheet({
           )}
 
           {/* 通用数值 */}
-          <div className="space-y-1.5">
-            <Label>难度系数</Label>
-            <Select value={String(form.difficulty)} onValueChange={(v) => set("difficulty", Number(v))}>
-              <SelectTrigger data-testid="select-difficulty">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {DIFFICULTIES.map((d) => (
-                  <SelectItem key={d.value} value={String(d.value)}>
-                    {d.name} ×{d.mul}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label>难度系数</Label>
+              <Select value={String(form.difficulty)} onValueChange={(v) => set("difficulty", Number(v))}>
+                <SelectTrigger data-testid="select-difficulty">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DIFFICULTIES.map((d) => (
+                    <SelectItem key={d.value} value={String(d.value)}>
+                      {d.name} ×{d.mul}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label>优先级</Label>
+              <Select value={String(form.priority)} onValueChange={(v) => set("priority", Number(v))}>
+                <SelectTrigger data-testid="select-priority">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">无</SelectItem>
+                  <SelectItem value="1">低</SelectItem>
+                  <SelectItem value="2">中</SelectItem>
+                  <SelectItem value="3">高</SelectItem>
+                  <SelectItem value="4">最高</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           <div className="grid grid-cols-3 gap-3">
@@ -551,11 +806,39 @@ export function TaskFormSheet({
             </Button>
           </div>
           <p className="text-[11px] text-muted-foreground">
-            当前配置：{categoryName(form.category)} · 单份 <Num>{form.xpPerUnit}</Num> XP
+            当前配置：{categoryName(form.category)} · {modeName(form.mode)} · {repeatName(form.repeat)} · {metricName(form.targetMetric)} · 单份{" "}
+            <Num>{form.xpPerUnit}</Num> XP
           </p>
         </div>
       </SheetContent>
     </Sheet>
+  );
+}
+
+function FinishSelect({
+  value,
+  onChange,
+  testId,
+}: {
+  value: 0 | 1;
+  onChange: (v: 0 | 1) => void;
+  testId: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={testId} className="block text-xs leading-tight">
+        达成后
+      </Label>
+      <Select value={String(value)} onValueChange={(v) => onChange(v === "1" ? 1 : 0)}>
+        <SelectTrigger data-testid={testId}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="0">继续累计</SelectItem>
+          <SelectItem value="1">完成并归档</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
   );
 }
 

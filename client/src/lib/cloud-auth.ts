@@ -1,83 +1,61 @@
-// ============================================================
-// 云端账号（SPEC-V2 1.2）
-//
-// 邮箱 + 密码注册 / 登录 / 登出 / 重置密码。
-// 登录成功后在本机建立（或复用）一个镜像账号，UI 依旧只读本地 IndexedDB。
-// 「本地模式」保持可用：不登录也能完整使用，随时可升级为云端账号。
-// ============================================================
-import { attachCloudSession } from "./localdb";
-import { authErrorText, rememberEnabled, setRememberEnabled, supabase } from "./supabase";
+// V0.6：自托管在线后端认证。用户在设置页配置服务器地址、邮箱和密码。
+import { serverLogin, serverRegister, serverMe } from "./server-api";
+import { serverConnectCurrent, serverCurrentUser } from "./localdb";
 
-export class CloudAuthError extends Error {
-  needsConfirm: boolean;
-  constructor(message: string, needsConfirm = false) {
-    super(message);
-    this.needsConfirm = needsConfirm;
-  }
-}
+export type CloudSession = {
+  user: any;
+  token: string;
+  email: string;
+  cloudUserId: string;
+};
 
-export type CloudSession = { user: any; token: string; email: string; cloudUserId: string };
-
-async function attach(cloudUserId: string, email: string, displayName?: string): Promise<CloudSession> {
-  const { user, token } = await attachCloudSession({
-    cloudUserId,
-    email,
-    displayName,
-    remember: rememberEnabled(),
+export async function cloudSignIn(
+  serverUrl: string,
+  email: string,
+  password: string,
+): Promise<CloudSession> {
+  const data = await serverLogin(serverUrl, email, password);
+  const token = String(data.token || "");
+  const id = String(data.user?.id || "");
+  if (!token || !id) throw new Error("服务器没有返回有效的登录信息");
+  const { user, token: localToken } = await serverConnectCurrent({
+    serverUrl,
+    token,
+    cloudUserId: id,
+    email: data.user?.email || email,
   });
-  return { user, token, email, cloudUserId };
-}
-
-export async function cloudSignIn(email: string, password: string, remember: boolean): Promise<CloudSession> {
-  setRememberEnabled(remember);
-  const { data, error } = await supabase().auth.signInWithPassword({ email: email.trim(), password });
-  if (error) throw new CloudAuthError(authErrorText(error.message), /not confirmed/i.test(error.message));
-  if (!data.user) throw new CloudAuthError("登录没能完成，请再试一次");
-  return attach(data.user.id, data.user.email ?? email.trim(), data.user.user_metadata?.display_name);
+  return { user, token: localToken, email: data.user?.email || email, cloudUserId: id };
 }
 
 export async function cloudSignUp(
+  serverUrl: string,
   email: string,
   password: string,
-  displayName: string,
-  remember: boolean,
-): Promise<CloudSession | { needsConfirm: true; email: string }> {
-  setRememberEnabled(remember);
-  const clean = email.trim();
-  const { data, error } = await supabase().auth.signUp({
-    email: clean,
-    password,
-    options: { data: { display_name: displayName.trim() || clean.split("@")[0] } },
+): Promise<CloudSession> {
+  const data = await serverRegister(serverUrl, email, password);
+  const token = String(data.token || "");
+  const id = String(data.user?.id || "");
+  if (!token || !id) throw new Error("服务器没有返回有效的注册信息");
+  const { user, token: localToken } = await serverConnectCurrent({
+    serverUrl,
+    token,
+    cloudUserId: id,
+    email: data.user?.email || email,
   });
-  if (error) throw new CloudAuthError(authErrorText(error.message));
-  if (!data.session) return { needsConfirm: true, email: clean };
-  return attach(data.user!.id, data.user!.email ?? clean, displayName);
+  return { user, token: localToken, email: data.user?.email || email, cloudUserId: id };
 }
 
-export async function cloudResetPassword(email: string) {
-  const { error } = await supabase().auth.resetPasswordForEmail(email.trim(), {
-    redirectTo: window.location.origin + window.location.pathname,
-  });
-  if (error) throw new CloudAuthError(authErrorText(error.message));
+export async function currentCloudUser(): Promise<{ id: string; email: string } | null> {
+  return serverCurrentUser();
 }
 
 export async function cloudSignOut() {
-  try {
-    await supabase().auth.signOut();
-  } catch {
-    /* 离线时本地登出即可，云端 session 到期自然失效 */
-  }
+  // 后端 token 由用户主动断开时清理；本地会话由 logout 流程处理。
 }
 
-/** 启动时：本机是否还有有效的云端 session（对应「记住登录状态」） */
-export async function currentCloudUser(): Promise<{ id: string; email: string } | null> {
-  try {
-    const { data } = await supabase().auth.getSession();
-    if (!data.session) return null;
-    return { id: data.session.user.id, email: data.session.user.email ?? "" };
-  } catch {
-    return null;
-  }
+export async function verifyCloudConnection(
+  serverUrl: string,
+  token: string,
+): Promise<void> {
+  await serverMe(serverUrl, token);
 }
-
-export { rememberEnabled, setRememberEnabled };

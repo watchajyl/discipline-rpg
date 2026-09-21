@@ -22,8 +22,21 @@ export type User = {
   aiBaseUrl: string;
   aiApiKey: string;           // AES-256-GCM 加密后的密文
   aiModel: string;
+  /** V0.5：GitHub 私有仓库同步令牌（AES-256-GCM 加密后的密文） */
+  githubToken?: string;
+  /** V0.5：GitHub 同步仓库，格式 owner/repo */
+  githubRepo?: string;
+  /** V0.6：自托管在线后端地址 */
+  serverUrl?: string;
+  /** V0.6：在线后端登录令牌（AES-256-GCM 加密后的密文） */
+  serverToken?: string;
   createdAt: number;
 };
+
+/** V3：任务目标的重复方式；none = 一次性总目标，daily / weekly = 每周期重置 */
+export type RepeatMode = "none" | "daily" | "weekly";
+/** V3：任务达标口径；checkin = 打卡次数，count = 完成数量，blocks = 专注块数 */
+export type TargetMetric = "checkin" | "count" | "blocks";
 
 export type Session = {
   token: string;
@@ -65,6 +78,20 @@ export type Task = {
   targetCount: number;
   currentCount: number;
   createdAt: number;
+  /** V3：周期重复方式（兼容旧数据缺省推断） */
+  repeat?: RepeatMode;
+  /** V3：达标口径（兼容旧数据缺省推断） */
+  targetMetric?: TargetMetric;
+  /** V3：每周期或总目标量 */
+  targetAmount?: number;
+  /** V3：一次性任务达成目标后自动归档（1 = 是） */
+  finishOnTarget?: number;
+  /** V4：优先级 0-4；0 = 无，4 = 最高 */
+  priority?: number;
+  /** V4：截止日期 YYYY-MM-DD（与 endDate 同义，便于计划直接使用） */
+  deadline?: string;
+  /** V0.3：每日开销预算（分）；存在即视为每日预算任务 */
+  dailyBudgetCents?: number;
 };
 
 export type Log = {
@@ -128,6 +155,87 @@ export type Timer = {
   updatedAt: number;
 };
 
+/** V3：全局专注计时器（番茄钟）；taskId 为空表示自由专注 */
+export type FocusTimer = {
+  id: number;
+  userId: number;
+  taskId: number | null;
+  kind: "focus" | "game";
+  startedAt: number;
+  accumulatedMs: number;
+  running: number;
+  capMinutes: number;
+  updatedAt: number;
+};
+
+/** V4：复盘日记 / 未来规划（本地保存，条目按 kind + periodKey 幂等） */
+export type JournalEntry = {
+  id: number;
+  userId: number;
+  kind: "review" | "plan";
+  period: "daily" | "weekly";
+  periodKey: string;
+  content: string;
+  aiFeedback?: string;
+  /** AI 拆解出的任务建议 JSON 字符串 */
+  aiPlan?: string;
+  createdAt: number;
+  updatedAt?: number;
+};
+
+/** V0.2：睡眠记录；day 为入睡当天日期（YYYY-MM-DD） */
+export type SleepLog = {
+  id: number;
+  userId: number;
+  day: string;
+  sleepTime: string;
+  wakeTime: string;
+  durationMinutes: number;
+  xp: number;
+  points: number;
+  prof: number;
+  createdAt: number;
+  updatedAt?: number;
+};
+
+/** V0.3：开销类别 */
+export type ExpenseCategory = "food" | "life" | "fun" | "study";
+
+/** V0.3：单笔开销（金额统一按“分”存整数，避免浮点误差） */
+export type Expense = {
+  id: number;
+  userId: number;
+  day: string;
+  category: ExpenseCategory;
+  amountCents: number;
+  note: string;
+  createdAt: number;
+  updatedAt?: number;
+};
+
+/** V0.4：智能规划聊天中的一条消息 */
+export type PlannerMessage = {
+  role: "user" | "assistant";
+  content: string;
+  action?: "ask" | "plan" | "blocked" | "done";
+  question?: string;
+  options?: string[];
+  plan?: {
+    summary: string;
+    tasks: unknown[];
+  };
+  createdAt: number;
+};
+
+/** V0.4：智能规划会话（本地保存，不随云端同步） */
+export type PlannerSession = {
+  id: number;
+  userId: number;
+  messages: PlannerMessage[];
+  askCount: number;
+  updatedAt: number;
+};
+
 // ---------------- Zod ----------------
 export const milestoneSchema = z.object({
   id: z.string(),
@@ -174,6 +282,13 @@ export const insertTaskSchema = z.object({
   targetPerPeriod: z.number().int().min(1).max(100).default(1),
   unitName: z.string().max(20).default("次"),
   targetCount: z.number().int().min(1).max(1000000).default(10),
+  repeat: z.enum(["none", "daily", "weekly"]).optional(),
+  targetMetric: z.enum(["checkin", "count", "blocks"]).optional(),
+  targetAmount: z.number().int().min(1).max(1000000).optional(),
+  finishOnTarget: z.number().int().min(0).max(1).optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  deadline: z.string().max(10).optional(),
+  dailyBudgetCents: z.number().int().min(1).max(100000000).optional(),
 });
 export type InsertTask = z.infer<typeof insertTaskSchema>;
 
