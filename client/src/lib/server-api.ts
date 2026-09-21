@@ -64,6 +64,30 @@ export async function serverRegister(base: string, email: string, password: stri
   return parse(res);
 }
 
+export async function serverSendCode(base: string, email: string, purpose: "register" | "reset") {
+  const res = await serverFetch(base, "/api/auth/send-code", {
+    method: "POST",
+    body: JSON.stringify({ email, purpose }),
+  });
+  return parse(res);
+}
+
+export async function serverRegisterWithCode(base: string, email: string, password: string, code: string) {
+  const res = await serverFetch(base, "/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ email, password, code }),
+  });
+  return parse(res);
+}
+
+export async function serverResetPassword(base: string, email: string, code: string, password: string) {
+  const res = await serverFetch(base, "/api/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ email, code, password }),
+  });
+  return parse(res);
+}
+
 export async function serverMe(base: string, token: string) {
   const res = await serverFetch(base, "/api/auth/me", {
     headers: { Authorization: `Bearer ${token}` },

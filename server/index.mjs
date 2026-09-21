@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import nodemailer from "nodemailer";
 
 const PORT = Number(process.env.PORT || 8787);
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "server", "data.sqlite");
@@ -29,6 +30,15 @@ db.exec(`
     updated_at integer not null,
     data text not null
   );
+  create table if not exists verification_codes (
+    id integer primary key autoincrement,
+    email text not null,
+    purpose text not null,
+    code_hash text not null,
+    expires_at integer not null,
+    consumed integer not null default 0,
+    created_at integer not null
+  );
 `);
 
 const cleanEmail = (s) => String(s || "").trim().toLowerCase();
@@ -53,6 +63,56 @@ function newId() {
 
 function newToken() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+function hashCode(code) {
+  return crypto.createHash("sha256").update(String(code)).digest("hex");
+}
+
+function smtpConfigured() {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+async function sendVerificationCode(email, code) {
+  if (!smtpConfigured()) throw new Error("邮件服务尚未配置");
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: process.env.SMTP_SECURE !== "false",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: "自律成长系统验证码",
+    text: `你的验证码是：${code}，10 分钟内有效。如果不是你本人操作，请忽略这封邮件。`,
+  });
+}
+
+function issueVerificationCode(email, purpose) {
+  const code = String(crypto.randomInt(100000, 1000000));
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  db.prepare("delete from verification_codes where email = ? and purpose = ?").run(email, purpose);
+  db.prepare("insert into verification_codes(email, purpose, code_hash, expires_at, created_at) values (?, ?, ?, ?, ?)").run(
+    email,
+    purpose,
+    hashCode(code),
+    expiresAt,
+    Date.now(),
+  );
+  return code;
+}
+
+function consumeVerificationCode(email, purpose, code) {
+  const row = db
+    .prepare("select id, code_hash, expires_at, consumed from verification_codes where email = ? and purpose = ? order by id desc limit 1")
+    .get(email, purpose);
+  if (!row || row.consumed || row.expires_at < Date.now() || row.code_hash !== hashCode(code)) return false;
+  db.prepare("update verification_codes set consumed = 1 where id = ?").run(row.id);
+  return true;
 }
 
 function json(res, status, data) {
@@ -120,8 +180,10 @@ route("POST", /^\/api\/auth\/register$/, async (req, res) => {
   const body = await readBody(req);
   const email = cleanEmail(body.email);
   const password = String(body.password || "");
+  const code = String(body.code || "");
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, 400, { error: "邮箱格式不正确" });
   if (password.length < 6) return json(res, 400, { error: "密码至少 6 位" });
+  if (!consumeVerificationCode(email, "register", code)) return json(res, 400, { error: "验证码不正确或已过期" });
   const exists = db.prepare("select id from users where email = ?").get(email);
   if (exists) return json(res, 409, { error: "该邮箱已注册" });
   const id = newId();
@@ -132,6 +194,36 @@ route("POST", /^\/api\/auth\/register$/, async (req, res) => {
     Date.now(),
   );
   return json(res, 200, { token: issueSession(id), user: publicUser(id) });
+});
+
+route("POST", /^\/api\/auth\/send-code$/, async (req, res) => {
+  const body = await readBody(req);
+  const email = cleanEmail(body.email);
+  const purpose = body.purpose === "reset" ? "reset" : "register";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, 400, { error: "邮箱格式不正确" });
+  const exists = db.prepare("select id from users where email = ?").get(email);
+  if (purpose === "register" && exists) return json(res, 409, { error: "该邮箱已注册" });
+  if (purpose === "reset" && !exists) return json(res, 404, { error: "该邮箱尚未注册" });
+  const code = issueVerificationCode(email, purpose);
+  try {
+    await sendVerificationCode(email, code);
+    return json(res, 200, { ok: true, message: "验证码已发送" });
+  } catch (e) {
+    return json(res, 500, { error: e?.message || "验证码发送失败" });
+  }
+});
+
+route("POST", /^\/api\/auth\/reset-password$/, async (req, res) => {
+  const body = await readBody(req);
+  const email = cleanEmail(body.email);
+  const code = String(body.code || "");
+  const password = String(body.password || "");
+  if (!consumeVerificationCode(email, "reset", code)) return json(res, 400, { error: "验证码不正确或已过期" });
+  if (password.length < 6) return json(res, 400, { error: "密码至少 6 位" });
+  const user = db.prepare("select id from users where email = ?").get(email);
+  if (!user) return json(res, 404, { error: "该邮箱尚未注册" });
+  db.prepare("update users set password_hash = ? where id = ?").run(hashPassword(password), user.id);
+  return json(res, 200, { ok: true, message: "密码已重置" });
 });
 
 route("POST", /^\/api\/auth\/login$/, async (req, res) => {

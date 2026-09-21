@@ -1,5 +1,5 @@
 // V0.6：自托管在线后端认证。用户在设置页配置服务器地址、邮箱和密码。
-import { serverBaseUrl, serverLogin, serverRegister, serverMe } from "./server-api";
+import { serverBaseUrl, serverLogin, serverMe, serverRegisterWithCode, serverSendCode, serverResetPassword } from "./server-api";
 import { serverConnectCurrent, serverCurrentUser } from "./localdb";
 
 export type CloudSession = {
@@ -33,9 +33,10 @@ export async function cloudSignUp(
   password: string,
   _displayName = "",
   _remember = true,
+  code = "",
 ): Promise<CloudSession> {
   const serverUrl = serverBaseUrl();
-  const data = await serverRegister(serverUrl, email, password);
+  const data = await serverRegisterWithCode(serverUrl, email, password, code);
   const token = String(data.token || "");
   const id = String(data.user?.id || "");
   if (!token || !id) throw new Error("服务器没有返回有效的注册信息");
@@ -57,7 +58,15 @@ export async function cloudSignOut() {
 }
 
 export async function cloudResetPassword(_email: string) {
-  throw new Error("当前服务器尚未配置邮件服务，暂时无法发送重置邮件。");
+  throw new Error("请使用验证码重置密码");
+}
+
+export async function cloudSendCode(email: string, purpose: "register" | "reset") {
+  return serverSendCode(serverBaseUrl(), email, purpose);
+}
+
+export async function cloudResetPasswordWithCode(email: string, code: string, password: string) {
+  return serverResetPassword(serverBaseUrl(), email, code, password);
 }
 
 export async function verifyCloudConnection(

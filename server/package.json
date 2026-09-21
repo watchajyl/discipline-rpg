@@ -9,5 +9,8 @@
   "scripts": {
     "start": "node index.mjs",
     "dev": "node --watch index.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16"
   }
 }

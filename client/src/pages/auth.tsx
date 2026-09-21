@@ -11,7 +11,7 @@ import { ACHIEVEMENTS } from "@shared/achievements";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Loader2, ShieldQuestion, Sparkles, AlertTriangle, Cloud, HardDrive, MailCheck } from "lucide-react";
 import { CATEGORIES } from "@shared/gameRules";
-import { cloudResetPassword, cloudSignIn, cloudSignUp } from "@/lib/cloud-auth";
+import { cloudResetPasswordWithCode, cloudSendCode, cloudSignIn, cloudSignUp } from "@/lib/cloud-auth";
 import { rememberEnabled, setRememberEnabled } from "@/lib/supabase";
 
 type Mode = "login" | "register" | "reset";
@@ -30,6 +30,8 @@ export default function AuthPage() {
   const [cloudName, setCloudName] = useState("");
   const [remember, setRemember] = useState(rememberEnabled());
   const [confirmSent, setConfirmSent] = useState("");
+  const [code, setCode] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
 
   // 本地模式
   const [username, setUsername] = useState("");
@@ -60,27 +62,34 @@ export default function AuthPage() {
   });
 
   const cloudRegister = useMutation({
-    mutationFn: () => cloudSignUp(email, cloudPassword, cloudName, remember),
+    mutationFn: () => cloudSignUp(email, cloudPassword, cloudName, remember, code),
     onSuccess: (d: any) => {
-      if (d?.needsConfirm) {
-        setConfirmSent(d.email);
-        setMode("login");
-        toast({ title: "确认邮件已发出", description: "点开邮件里的链接完成确认后，就可以登录了。" });
-        return;
-      }
       toast({ title: "云端账号已创建", description: "开始记录你的第一件小事吧。" });
       setSession(d.user, d.token);
+      setCodeSent(false);
+      setCode("");
     },
     onError: (e: any) => toast({ title: "注册失败", description: cleanErr(e), variant: "destructive" }),
   });
 
   const cloudReset = useMutation({
-    mutationFn: () => cloudResetPassword(email),
+    mutationFn: () => cloudResetPasswordWithCode(email, code, cloudPassword),
     onSuccess: () => {
-      toast({ title: "重置邮件已发出", description: "请查收邮箱，按链接设置新密码。" });
+      toast({ title: "密码已重置", description: "请用新密码登录。" });
       setMode("login");
+      setCode("");
+      setCodeSent(false);
     },
     onError: (e: any) => toast({ title: "发送失败", description: cleanErr(e), variant: "destructive" }),
+  });
+
+  const sendCode = useMutation({
+    mutationFn: (purpose: "register" | "reset") => cloudSendCode(email, purpose),
+    onSuccess: () => {
+      setCodeSent(true);
+      toast({ title: "验证码已发送", description: "请查收邮箱，10 分钟内有效。" });
+    },
+    onError: (e: any) => toast({ title: "验证码发送失败", description: cleanErr(e), variant: "destructive" }),
   });
 
   // ---------------- 本地模式 ----------------
@@ -149,7 +158,7 @@ export default function AuthPage() {
   });
 
   const busy =
-    cloudLogin.isPending || cloudRegister.isPending || cloudReset.isPending || login.isPending || register.isPending;
+    cloudLogin.isPending || cloudRegister.isPending || cloudReset.isPending || sendCode.isPending || login.isPending || register.isPending;
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10 paper-grain">
@@ -227,18 +236,30 @@ export default function AuthPage() {
                   <div>
                     <p className="text-base font-semibold">重置云端账号密码</p>
                     <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                      我们会给这个邮箱发一封重置链接，按链接设置新密码。
+                      我们会给这个邮箱发送验证码，输入验证码后设置新密码。
                     </p>
                   </div>
                   <Field label="邮箱" value={email} onChange={setEmail} type="email" testId="input-cloud-reset-email" />
                   <Button
+                    variant="secondary"
+                    className="w-full"
+                    onClick={() => sendCode.mutate("reset")}
+                    disabled={!email || sendCode.isPending}
+                    data-testid="button-cloud-send-reset-code"
+                  >
+                    {sendCode.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <MailCheck className="mr-1.5 h-4 w-4" />}
+                    发送验证码
+                  </Button>
+                  <Field label="验证码" value={code} onChange={setCode} testId="input-cloud-reset-code" />
+                  <Field label="新密码" value={cloudPassword} onChange={setCloudPassword} type="password" testId="input-cloud-reset-password" />
+                  <Button
                     className="w-full"
                     onClick={() => cloudReset.mutate()}
-                    disabled={!email || cloudReset.isPending}
+                    disabled={!email || !code || cloudPassword.length < 6 || cloudReset.isPending}
                     data-testid="button-cloud-reset"
                   >
                     {cloudReset.isPending && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-                    发送重置邮件
+                    重置密码
                   </Button>
                   <button
                     className="w-full text-center text-xs text-muted-foreground underline-offset-4 hover:underline"
@@ -270,11 +291,26 @@ export default function AuthPage() {
                     type="password"
                     testId="input-cloud-password"
                   />
+                  <div className="flex items-end gap-2">
+                    <div className="flex-1">
+                      <Field label="验证码" value={code} onChange={setCode} testId="input-cloud-register-code" />
+                    </div>
+                    <Button
+                      variant="secondary"
+                      className="h-10 shrink-0"
+                      onClick={() => sendCode.mutate("register")}
+                      disabled={!email || sendCode.isPending}
+                      data-testid="button-cloud-send-register-code"
+                    >
+                      {sendCode.isPending ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : <MailCheck className="mr-1 h-4 w-4" />}
+                      发送验证码
+                    </Button>
+                  </div>
                   <RememberBox checked={remember} onChange={setRemember} testId="checkbox-remember-cloud-register" />
                   <Button
                     className="w-full"
                     onClick={() => cloudRegister.mutate()}
-                    disabled={busy}
+                    disabled={busy || !email || !code || cloudPassword.length < 6}
                     data-testid="button-cloud-register"
                   >
                     {cloudRegister.isPending && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
