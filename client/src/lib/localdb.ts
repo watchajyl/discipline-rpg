@@ -4308,9 +4308,10 @@ export async function githubConnectCurrent(input: {
   u.githubToken = await encryptSecretValue(String(input.token ?? ""), doc.appSecret);
   u.githubRepo = repo;
   backfillUids(userId);
+  purgeExpiredSessions();
+  const token = await createSession(userId, true);
   await persist();
-  const s = getSession(authToken);
-  return { user: await publicUser(userId), token: s?.token ?? "" };
+  return { user: await publicUser(userId), token };
 }
 
 /** V0.5：断开当前账号的 GitHub 同步，恢复纯本地模式 */
@@ -4362,9 +4363,10 @@ export async function serverConnectCurrent(input: {
   u.githubToken = "";
   u.githubRepo = "";
   backfillUids(userId);
+  purgeExpiredSessions();
+  const token = await createSession(userId, true);
   await persist();
-  const s = getSession(authToken);
-  return { user: await publicUser(userId), token: s?.token ?? "" };
+  return { user: await publicUser(userId), token };
 }
 
 /** V0.6：当前会话对应的在线后端用户 id，用于启动时恢复登录 */
