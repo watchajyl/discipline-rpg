@@ -1,0 +1,5 @@
+# 将 example.com 替换成你的域名。Caddy 会自动申请并续期 HTTPS 证书。
+example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8787
+}
