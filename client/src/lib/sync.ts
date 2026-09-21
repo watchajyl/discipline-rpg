@@ -198,7 +198,7 @@ export function startSyncLoop() {
   });
   timer = window.setInterval(() => {
     if (!document.hidden) void syncNow();
-  }, 60_000);
+  }, 3000);
   void syncNow();
 }
 
