@@ -6,7 +6,7 @@ import { useToast } from "@/hooks/use-toast";
 import type { Profile } from "@/lib/types";
 import { Num, PageHeader } from "@/components/bits";
 import { UpkeepSettingsSection } from "@/components/upkeep-settings";
-import { ServerSyncSection } from "@/components/server-sync-settings";
+import { SyncSettingsSection } from "@/components/sync-settings";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -230,8 +230,8 @@ export default function SettingsPage() {
           )}
         </Section>
 
-        {/* 在线云同步（V0.6） */}
-        <ServerSyncSection />
+        {/* 云端同步 */}
+        <SyncSettingsSection />
 
         {/* 每日维持（V2） */}
         <UpkeepSettingsSection />
