@@ -1,6 +1,6 @@
 // V0.6：自托管在线后端认证。用户在设置页配置服务器地址、邮箱和密码。
 import { serverBaseUrl, serverLogin, serverMe, serverRegisterWithCode, serverSendCode, serverResetPassword } from "./server-api";
-import { serverConnectCurrent, serverCurrentUser } from "./localdb";
+import { attachServerSession, serverCurrentUser } from "./localdb";
 
 export type CloudSession = {
   user: any;
@@ -19,7 +19,7 @@ export async function cloudSignIn(
   const token = String(data.token || "");
   const id = String(data.user?.id || "");
   if (!token || !id) throw new Error("服务器没有返回有效的登录信息");
-  const { user, token: localToken } = await serverConnectCurrent({
+  const { user, token: localToken } = await attachServerSession({
     serverUrl,
     token,
     cloudUserId: id,
@@ -40,7 +40,7 @@ export async function cloudSignUp(
   const token = String(data.token || "");
   const id = String(data.user?.id || "");
   if (!token || !id) throw new Error("服务器没有返回有效的注册信息");
-  const { user, token: localToken } = await serverConnectCurrent({
+  const { user, token: localToken } = await attachServerSession({
     serverUrl,
     token,
     cloudUserId: id,

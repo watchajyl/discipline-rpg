@@ -4369,6 +4369,55 @@ export async function serverConnectCurrent(input: {
   return { user: await publicUser(userId), token };
 }
 
+/** V0.6：在线后端登录/注册时创建或复用本地镜像账号，不要求已有本地会话 */
+export async function attachServerSession(input: {
+  serverUrl: string;
+  token: string;
+  cloudUserId: string;
+  email: string;
+}): Promise<{ user: any; token: string }> {
+  await ensureLoaded();
+  let user = doc.users.find((u) => u.cloudUserId === input.cloudUserId);
+  if (!user) {
+    user = {
+      id: nextId("users"),
+      username: input.email,
+      cloudUserId: input.cloudUserId,
+      email: input.email,
+      password: "",
+      displayName: input.email.split("@")[0],
+      securityQuestion: "",
+      securityAnswer: "",
+      xp: 0,
+      points: 0,
+      theme: "dark",
+      aiBaseUrl: "https://api.deepseek.com/v1",
+      aiApiKey: "",
+      aiModel: "deepseek-chat",
+      serverUrl: String(input.serverUrl ?? "").trim(),
+      serverToken: await encryptSecretValue(String(input.token ?? ""), doc.appSecret),
+      createdAt: Date.now(),
+    };
+    doc.users.push(user);
+    for (const c of CATEGORY_KEYS) {
+      doc.proficiency.push({ id: nextId("proficiency"), userId: user.id, category: c, value: 0 });
+    }
+    for (const r of DEFAULT_REWARDS) {
+      doc.rewards.push({ ...r, id: nextId("rewards"), uid: newUid(), userId: user.id, createdAt: Date.now(), updatedAt: Date.now(), deletedAt: null });
+    }
+  } else {
+    user.email = input.email;
+    user.username = input.email;
+    user.serverUrl = String(input.serverUrl ?? "").trim();
+    user.serverToken = await encryptSecretValue(String(input.token ?? ""), doc.appSecret);
+  }
+  backfillUids(user.id);
+  purgeExpiredSessions();
+  const localToken = await createSession(user.id, true);
+  await persist();
+  return { user: await publicUser(user.id), token: localToken };
+}
+
 /** V0.6：当前会话对应的在线后端用户 id，用于启动时恢复登录 */
 export async function serverCurrentUser(): Promise<{ id: string; email: string } | null> {
   await ensureLoaded();
